@@ -49,3 +49,13 @@ wgp_config.json
 plugins_local.json
 loras_url_cache.json
 loras_url_cache_v2.json
+
+# Local Python virtual environment
+venv/
+
+# Startup log (not caught by *.log)
+startup_log.txt
+
+# Third-party plugins installed via the web UI plugin manager
+plugins/wan2gp-gallery/
+plugins/wan2gp-lora-multipliers-ui/
