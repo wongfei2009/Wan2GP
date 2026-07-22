@@ -295,6 +295,24 @@ def build_server(args: argparse.Namespace):
         return session.get_model_schema(model_type)
 
     @mcp.tool()
+    def wangp_list_loras(model_type: str) -> dict[str, Any]:
+        """List LoRA files installed for a model's family (same directory scan as the UI dropdown)."""
+
+        return session.list_loras(model_type)
+
+    @mcp.tool()
+    def wangp_get_lora_header(model_type: str, file: str, include_tensors: bool = False) -> dict[str, Any]:
+        """Read a LoRA's safetensors JSON header without loading tensors: __metadata__ (trigger words, training config) plus a tensor summary with a key-format guess ('diffusers' = will not load in WanGP). include_tensors adds the full tensor index."""
+
+        return session.get_lora_header(model_type, file, include_tensors=include_tensors)
+
+    @mcp.tool()
+    def wangp_download_lora(url: str, model_type: str) -> dict[str, Any]:
+        """Download a LoRA by URL into the model's lora directory. Civitai model-page and api/download URLs are resolved via the public metadata API (most Civitai downloads need CIVITAI_API_TOKEN in the server environment); other URLs download directly. Returns trained_words when Civitai provides them; idempotent when the file already exists."""
+
+        return session.download_lora(url, model_type)
+
+    @mcp.tool()
     def wangp_generate(source: dict[str, Any] | list[dict[str, Any]], wait: bool = False, timeout_s: float | None = None, event_limit: int = 20) -> dict[str, Any]:
         """Start a WanGP generation from a settings dict, task dict, or task list."""
 

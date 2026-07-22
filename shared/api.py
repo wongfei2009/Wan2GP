@@ -555,6 +555,109 @@ class WanGPSession:
             "default_settings": self.get_default_settings(model_type),
         }
 
+    def list_loras(self, model_type: str) -> dict[str, Any]:
+        import glob
+
+        if self.get_model_def(model_type) is None:
+            raise ValueError(f"Unknown model_type: {model_type}")
+        runtime = self._ensure_runtime()
+        records: list[dict[str, Any]] = []
+        with _pushd(runtime.root):
+            lora_dir = runtime.module.get_lora_dir(model_type)
+            if os.path.isdir(lora_dir):
+                # Same scan as the UI dropdown (wgp.setup_loras).
+                paths = glob.glob(os.path.join(lora_dir, "**", "*.sft"), recursive=True) + glob.glob(os.path.join(lora_dir, "**", "*.safetensors"), recursive=True)
+                paths.sort(key=lambda path: os.path.relpath(path, lora_dir).casefold())
+                for path in paths:
+                    rel_path = os.path.relpath(path, lora_dir)
+                    url = runtime.module.get_lora_URL(lora_dir, rel_path)
+                    if isinstance(url, str) and url.startswith(("http:", "https:")):
+                        url = url.split("|")[0]
+                    else:
+                        url = None
+                    file_stat = os.stat(path)
+                    records.append({
+                        "file": rel_path.replace(os.sep, "/"),
+                        "size_bytes": file_stat.st_size,
+                        "mtime": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(file_stat.st_mtime)),
+                        "url": url,
+                    })
+            lora_dir_abs = str(Path(lora_dir).resolve())
+        return {"model_type": str(model_type), "lora_dir": lora_dir_abs, "loras": records}
+
+    def get_lora_header(self, model_type: str, file: str, include_tensors: bool = False) -> dict[str, Any]:
+        from shared.utils.safetensors_header import inspect_safetensors
+
+        if self.get_model_def(model_type) is None:
+            raise ValueError(f"Unknown model_type: {model_type}")
+        runtime = self._ensure_runtime()
+        with _pushd(runtime.root):
+            lora_dir = runtime.module.get_lora_dir(model_type)
+            lora_root = os.path.realpath(lora_dir)
+            full_path = os.path.realpath(os.path.join(lora_dir, file))
+            # The MCP server has no auth; never let this become an arbitrary-file reader.
+            if not full_path.startswith(lora_root + os.sep):
+                raise ValueError(f"'{file}' escapes the lora directory")
+            if not os.path.isfile(full_path):
+                raise ValueError(f"Lora file not found: {file}")
+            result = inspect_safetensors(full_path, include_tensors=include_tensors)
+        result["file"] = str(file).replace("\\", "/")
+        result["model_type"] = str(model_type)
+        return result
+
+    def download_lora(self, url: str, model_type: str) -> dict[str, Any]:
+        import urllib.error
+        import urllib.parse
+
+        from shared.utils import civitai
+        from shared.utils.download import download_file
+
+        if not (isinstance(url, str) and url.startswith(("http://", "https://"))):
+            raise ValueError("url must be an http(s) URL")
+        if self.get_model_def(model_type) is None:
+            raise ValueError(f"Unknown model_type: {model_type}")
+        runtime = self._ensure_runtime()
+        info = civitai.resolve_civitai_url(url)
+        if info is not None:
+            download_url = info["download_url"]
+            filename = info["filename"]
+        else:
+            download_url = url
+            filename = civitai.sanitize_filename(os.path.basename(urllib.parse.urlsplit(url).path))
+        record: dict[str, Any] = {
+            "file": filename,
+            "trained_words": (info or {}).get("trained_words") or [],
+            "version_name": (info or {}).get("version_name"),
+            "model_name": (info or {}).get("model_name"),
+            "model_page": (info or {}).get("model_page"),
+        }
+        with _pushd(runtime.root):
+            lora_dir = runtime.module.get_lora_dir(model_type)
+            os.makedirs(lora_dir, exist_ok=True)
+            local_path = os.path.join(lora_dir, filename)
+            if os.path.isfile(local_path):
+                record.update({"size_bytes": os.path.getsize(local_path), "already_existed": True})
+                return record
+            try:
+                download_file(download_url, local_path)
+            except urllib.error.HTTPError as exc:
+                if info is not None and exc.code in (401, 403):
+                    raise ValueError(
+                        f"Civitai returned HTTP {exc.code} - set CIVITAI_API_TOKEN in the MCP server's environment"
+                        " (or this model requires login/purchase)"
+                    ) from exc
+                raise
+            # Record provenance under the resolved filename so get_lora_URL finds it;
+            # update_loras_url_cache can't express filename != basename(url).
+            runtime.module._ensure_loras_url_cache()
+            cache_key = lora_dir + "|" + filename
+            if runtime.module.loras_url_cache.get(cache_key) != url:
+                runtime.module.loras_url_cache[cache_key] = url.split("|")[0]
+                with open(runtime.module.loras_cache_file, "w", encoding="utf-8") as writer:
+                    writer.write(json.dumps(runtime.module.loras_url_cache, indent=4))
+            record.update({"size_bytes": os.path.getsize(local_path), "already_existed": False})
+        return record
+
     def submit(self, source: str | os.PathLike[str] | dict[str, Any] | list[dict[str, Any]], callbacks: object | None = None) -> SessionJob:
         tasks = self._normalize_source(source, caller_base_path=self._get_caller_base_path())
         return self._submit_tasks(tasks, callbacks=callbacks)

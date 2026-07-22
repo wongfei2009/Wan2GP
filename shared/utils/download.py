@@ -233,7 +233,46 @@ def download_file(url, filename):
             shutil.move(os.path.join(temp_full_path, onefile), tgt)
             shutil.rmtree(temp_dir_path)
     else:
-        from urllib.request import urlretrieve
+        download_url_to_file(url, filename)
 
-        urlretrieve(url, filename, create_progress_hook(filename))
+
+def download_url_to_file(url, filename, chunk_size=1024 * 1024):
+    """Plain-HTTP download with a real User-Agent, Civitai token support and an
+    atomic temp-file rename (no half-written files on failure).
+
+    Civitai auth goes in a ?token= query parameter, NOT an Authorization
+    header: urllib forwards headers across redirects, and Civitai redirects to
+    presigned S3 URLs that reject requests carrying a second auth mechanism.
+    """
+    import urllib.parse
+    import urllib.request
+
+    hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if hostname.endswith("civitai.com"):
+        token = os.environ.get("CIVITAI_API_TOKEN")
+        if token and "token=" not in url:
+            url = url + ("&" if "?" in url else "?") + "token=" + urllib.parse.quote(token)
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; WanGP)"})
+    hook = create_progress_hook(filename)
+    tmp_path = filename + ".part"
+    try:
+        with urllib.request.urlopen(request) as response:
+            total_size = int(response.headers.get("Content-Length") or -1)
+            with open(tmp_path, "wb") as writer:
+                block_num = 0
+                hook(block_num, chunk_size, total_size)
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                    block_num += 1
+                    hook(block_num, chunk_size, total_size)
+        os.replace(tmp_path, filename)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
