@@ -57,8 +57,11 @@ REM                  (HighRAM_LowVRAM) may instead be faster once it fits.
 REM
 REM Change one at a time so it stays clear which one moved the needle.
 REM
-REM Each can be overridden for a single launch without editing this file:
-REM   set VRAM_SAFETY=0.35 && mcp-server.bat
+REM Each can be overridden for a single launch without editing this file.
+REM Quote the assignment -- `set VAR=0.35 && ...` captures the space before the
+REM `&&` into the value:
+REM   set "VRAM_SAFETY=0.35" && mcp-server.bat
+REM ...or just set it on its own line first, then run the script.
 REM
 REM Known-good values on this box:
 REM   Pruned 20B (fl2va/ref2va_pruned) ... VRAM_SAFETY=0.5  works
