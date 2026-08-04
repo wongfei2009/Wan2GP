@@ -29,6 +29,38 @@ set MCP_HOST=0.0.0.0
 set MCP_PORT=7866
 set HTTP_PORT=7860
 
+REM ---------------------------------------------------------------------------
+REM Memory tuning (this box: RTX 5080 16 GB VRAM, 64 GB system RAM)
+REM
+REM Big models (MiniMax H3 20B/33B) failed to generate on the stock defaults.
+REM WanGP reports that as "unsufficient RAM ... perc_reserved_mem_max", but the
+REM message is a catch-all: the real traceback was
+REM   torch.AcceleratorError: CUDA error: out of memory
+REM while VAE-encoding a reference image. So the knob that actually matters here
+REM is VRAM_SAFETY, not PERC_RESERVED.
+REM
+REM   VRAM_SAFETY    Fraction of VRAM mmgp may fill with preloaded model weights
+REM                  (wgp.py default 0.8 -> up to ~12.8 GB of a 16 GB card, which
+REM                  leaves too little for activations). Lower = more headroom.
+REM                  If a model still OOMs, step down: 0.5 -> 0.4 -> 0.3.
+REM
+REM   PERC_RESERVED  Fraction of system RAM pinned for fast RAM->VRAM transfers.
+REM                  Default 0 = auto, which topped out near 25 GB and left the
+REM                  VAE / vision + video encoders unpinned ("no reserved RAM
+REM                  left. Transfer speed ... may be slower"). SPEED ONLY -- it
+REM                  cannot fix a CUDA OOM. Must stay BELOW 0.5.
+REM
+REM   PROFILE        mmgp memory profile 1-5 (wgp.py default 4 = LowRAM_LowVRAM).
+REM                  Try 5 (VerylowRAM_LowVRAM, offloads hardest) if lowering
+REM                  VRAM_SAFETY alone is not enough. With 64 GB of RAM, 2
+REM                  (HighRAM_LowVRAM) may instead be faster once it fits.
+REM
+REM Change one at a time so it stays clear which one moved the needle.
+REM ---------------------------------------------------------------------------
+set VRAM_SAFETY=0.5
+set PERC_RESERVED=0.45
+set PROFILE=4
+
 call venv\Scripts\activate.bat
 
 REM Make sure the outputs folder exists before serving it
@@ -39,4 +71,4 @@ REM --allow-replace keeps the uploaded filename intact (so the agent can predict
 start "WanGP Outputs HTTP" venv\Scripts\python.exe -m uploadserver %HTTP_PORT% --bind %MCP_HOST% --directory outputs --allow-replace
 
 REM Run the MCP server in the foreground (this window)
-python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output
+python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --profile %PROFILE% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED%
