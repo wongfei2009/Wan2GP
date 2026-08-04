@@ -56,10 +56,19 @@ REM                  VRAM_SAFETY alone is not enough. With 64 GB of RAM, 2
 REM                  (HighRAM_LowVRAM) may instead be faster once it fits.
 REM
 REM Change one at a time so it stays clear which one moved the needle.
+REM
+REM Each can be overridden for a single launch without editing this file:
+REM   set VRAM_SAFETY=0.35 && mcp-server.bat
+REM
+REM Known-good values on this box:
+REM   Pruned 20B (fl2va/ref2va_pruned) ... VRAM_SAFETY=0.5  works
+REM   Full 33B   (fl2va/ref2va)        ... needs LOWER; 0.5 OOMs in the VAE
+REM                                        encode. Try 0.35, then 0.3, then
+REM                                        PROFILE=5.
 REM ---------------------------------------------------------------------------
-set VRAM_SAFETY=0.5
-set PERC_RESERVED=0.45
-set PROFILE=4
+if "%VRAM_SAFETY%"==""   set VRAM_SAFETY=0.5
+if "%PERC_RESERVED%"=="" set PERC_RESERVED=0.45
+if "%PROFILE%"==""       set PROFILE=4
 
 call venv\Scripts\activate.bat
 
