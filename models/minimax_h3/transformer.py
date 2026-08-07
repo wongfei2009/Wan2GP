@@ -16,6 +16,7 @@
 # AdaLN curves, shared attention backends, chunked FFNs, and early tensor release.
 
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -24,6 +25,7 @@ import torch.nn.functional as F
 from shared.attention import pay_attention
 
 from .interrupt import GenerationInterrupted
+from .sol_attention import MiniMaxH3SolAttention
 from .components.packing import (
     MINIMAX_H3_AUDIO_TAG,
     MINIMAX_H3_KEYFRAME_NOISE_AUG,
@@ -147,10 +149,11 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden, heads, head_dim, eps, dtype=None, device=None):
+    def __init__(self, hidden, heads, head_dim, eps, sol_attention=None, dtype=None, device=None):
         super().__init__()
         self.heads = heads
         self.head_dim = head_dim
+        self.sol_attention = sol_attention
         inner = heads * head_dim
         self.qkv_proj = nn.Linear(hidden, 3 * inner, bias=False, dtype=dtype, device=device)
         self.q_norm = nn.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
@@ -160,9 +163,15 @@ class Attention(nn.Module):
     def forward(self, x_list, rope=None, transformer_options=None):
         x = _take(x_list)
         seq_len = x.shape[0]
-        if hasattr(self, "q_proj"):
-            query = self.q_norm(self.q_proj(x).view(1, seq_len, self.heads, self.head_dim))
-            key = self.k_norm(self.k_proj(x).view(1, seq_len, self.heads, self.head_dim))
+        use_sol = self.sol_attention is not None and self.sol_attention.use_for_layer(seq_len)
+        split_qkv = hasattr(self, "q_proj")
+        if split_qkv:
+            query = self.q_proj(x).view(1, seq_len, self.heads, self.head_dim)
+            if not use_sol:
+                query = self.q_norm(query)
+            key = self.k_proj(x).view(1, seq_len, self.heads, self.head_dim)
+            if not use_sol:
+                key = self.k_norm(key)
             value = self.v_proj(x).view(1, seq_len, self.heads, self.head_dim)
         else:
             qkv = self.qkv_proj(x)
@@ -170,14 +179,19 @@ class Attention(nn.Module):
             query = query.view(seq_len, self.heads, self.head_dim)
             key = key.view(seq_len, self.heads, self.head_dim)
             value = value.view(seq_len, self.heads, self.head_dim)
-            query, key, value = query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0).clone()
+            query, key, value = query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0)
+            if not use_sol:
+                value = value.clone()
             del qkv
         del x
-        if not hasattr(self, "q_proj"):
+        if use_sol:
+            from shared.sol_attn import qk_rms_norm_rope_
+            qk_rms_norm_rope_(query, key, self.q_norm.weight, self.k_norm.weight, rope, self.q_norm.eps)
+        elif not split_qkv:
             query, key = self.q_norm(query), self.k_norm(key)
         qkv_list = [query, key, value]
         del query, key, value
-        if rope is not None:
+        if rope is not None and not use_sol:
             pairs = rope.shape[-2]
             cosine, sine = rope[..., 0], rope[..., 1]
             scratch = torch.empty_like(qkv_list[0][..., :pairs])
@@ -188,7 +202,8 @@ class Attention(nn.Module):
                 first.mul_(cosine).addcmul_(second, sine, value=-1)
                 second.mul_(cosine).addcmul_(scratch, sine)
             del scratch, tensor, first, second
-        output = pay_attention(qkv_list, recycle_q=True).reshape(seq_len, -1)
+        attention = pay_attention(qkv_list, recycle_q=True) if self.sol_attention is None else self.sol_attention(qkv_list, use_sol)
+        output = attention.reshape(seq_len, -1)
         return self.out_proj(output)
 
 
@@ -266,22 +281,50 @@ def _gated_residual(hidden_list, gate_list, branch_list, segments):
 
 class DiTBlock(nn.Module):
     def __init__(self, hidden, heads, head_dim, ffn, time_dim, eps, qk_eps, apply_silu=True,
-                 adaln_dtype=None, ffn_chunk_size=2048, dtype=None, device=None):
+                 adaln_dtype=None, ffn_chunk_size=2048, sol_attention=None, dtype=None, device=None):
         super().__init__()
         self.norm1 = nn.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
-        self.attn = Attention(hidden, heads, head_dim, qk_eps, dtype=dtype, device=device)
+        self.attn = Attention(hidden, heads, head_dim, qk_eps, sol_attention=sol_attention, dtype=dtype, device=device)
         self.norm2 = nn.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.mlp = MLP(hidden, ffn, ffn_chunk_size, dtype=dtype, device=device)
         self.adaln_proj = AdalnProj(time_dim, hidden, 6, apply_silu=apply_silu,
                                     dtype=adaln_dtype or dtype, device=device)
 
-    def forward(self, x_list, temb, segments, rope):
+    @staticmethod
+    def _gated_branch(hidden, gate, branch, segments, signature_stride=0, signature=None):
+        for start, stop, row in segments:
+            branch[start:stop].mul_(gate[row])
+        if signature_stride:
+            # Sample the existing gated branch before it is released; never materialize a full block residual copy.
+            sampled = branch.reshape(-1)[::signature_stride]
+            if signature is None:
+                signature = sampled.clone()
+            else:
+                signature.add_(sampled)
+            hidden.add_(branch)
+        else:
+            branch.add_(hidden)
+            hidden.copy_(branch)
+        return hidden, signature
+
+    def forward(self, x_list, temb, segments, rope, residual_signature_elements=0):
         residual_list = [_take(x_list)]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
         h_list = [_modulate(self.norm1(residual_list[0]), [shift_msa, scale_msa], segments)]
-        residual_list = [_gated_residual(residual_list, [gate_msa], [self.attn(h_list, rope=rope)], segments)]
-        h_list = [_modulate(self.norm2(residual_list[0]), [shift_mlp, scale_mlp], segments)]
-        return _gated_residual(residual_list, [gate_mlp], [self.mlp(h_list)], segments)
+        if not residual_signature_elements:
+            residual_list = [_gated_residual(residual_list, [gate_msa], [self.attn(h_list, rope=rope)], segments)]
+            h_list = [_modulate(self.norm2(residual_list[0]), [shift_mlp, scale_mlp], segments)]
+            return _gated_residual(residual_list, [gate_mlp], [self.mlp(h_list)], segments)
+
+        hidden = _take(residual_list)
+        signature_stride = max(1, math.ceil(hidden.numel() / residual_signature_elements))
+        branch = self.attn(h_list, rope=rope)
+        hidden, signature = self._gated_branch(hidden, gate_msa.to(hidden.dtype), branch, segments, signature_stride)
+        del branch
+        h_list = [_modulate(self.norm2(hidden), [shift_mlp, scale_mlp], segments)]
+        branch = self.mlp(h_list)
+        hidden, signature = self._gated_branch(hidden, gate_mlp.to(hidden.dtype), branch, segments, signature_stride, signature)
+        return hidden, signature
 
 
 class FinalLayer(nn.Module):
@@ -332,6 +375,42 @@ def _prepared_references(refs):
 
 
 class MiniMaxH3Model(nn.Module):
+    def preprocess_loras(self, model_type, state_dict):
+        converted = {}
+        for key, value in state_dict.items():
+            if key.startswith("lora_unet_"):
+                path, suffix = key[len("lora_unet_"):].split(".", 1)
+                key = path.replace("blocks_", "blocks.", 1).replace("_attn_", ".attn.").replace("_mlp_", ".mlp.") + "." + suffix
+            for source, target in (("transformer_blocks.", "blocks."), (".attn.to_out.0.", ".attn.out_proj."),
+                                   (".attn.to_q.", ".attn.q_proj."), (".attn.to_k.", ".attn.k_proj."),
+                                   (".attn.to_v.", ".attn.v_proj.")):
+                key = key.replace(source, target)
+            converted[key] = value
+        from .lora_affine import convert_adaln_loras
+
+        start = time.perf_counter()
+        count, architecture, source_width, target_width = convert_adaln_loras(
+            model_type, converted, self.adaln_t_table if self.use_adaln_curves else None)
+        if count:
+            source = f"full-width {source_width}" if source_width == 2688 else f"{architecture.upper()} pruned rank {source_width}"
+            target = f"full-width {target_width}" if target_width == 2688 else f"{architecture.upper()} pruned rank {target_width}"
+            print(f"MiniMax H3 LoRA: converted {count} AdaLN adapters from {source} to {target} in {time.perf_counter() - start:.2f}s")
+        if hasattr(self.blocks[0].attn, "q_proj"):
+            return converted
+        for down_suffix, up_suffix in (("lora_A.weight", "lora_B.weight"), ("lora_down.weight", "lora_up.weight")):
+            marker = "q_proj." + down_suffix
+            for key in [key for key in converted if key.endswith(marker)]:
+                prefix = key[:-len(marker)]
+                down, up, scales = [], [], []
+                for projection in ("q_proj", "k_proj", "v_proj"):
+                    down.append(converted.pop(prefix + projection + "." + down_suffix))
+                    up.append(converted.pop(prefix + projection + "." + up_suffix))
+                    alpha = converted.pop(prefix + projection + ".alpha", None)
+                    scales.append(1.0 if alpha is None else float(alpha) / down[-1].shape[0])
+                converted[prefix + "qkv_proj." + down_suffix] = torch.cat(down)
+                converted[prefix + "qkv_proj." + up_suffix] = torch.block_diag(*(weight * scale for weight, scale in zip(up, scales)))
+        return converted
+
     def __init__(self, hidden_size=5376, num_layers=50, token_refiner_num_layers=2,
                  num_attention_heads=56, attention_head_dim=128, ffn_hidden_size=14336,
                  latents_dim=24, audio_latents_dim=32, patch_size=(1, 2, 2), text_dim=5120,
@@ -363,11 +442,13 @@ class MiniMaxH3Model(nn.Module):
         self.token_refiner = TokenRefiner(token_refiner_num_layers, hidden_size, num_attention_heads,
                                           attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps,
                                           final_norm_eps, dtype=dtype, device=device)
+        self.sol_attention = MiniMaxH3SolAttention()
         curve = {"apply_silu": not self.use_adaln_curves,
                  "adaln_dtype": torch.float32 if self.use_adaln_curves else dtype}
         self.blocks = nn.ModuleList([DiTBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size,
                                                time_embed_dim, norm_eps, qk_norm_eps, **curve,
-                                               ffn_chunk_size=ffn_chunk_size, dtype=dtype, device=device) for _ in range(num_layers)])
+                                               ffn_chunk_size=ffn_chunk_size, sol_attention=self.sol_attention,
+                                               dtype=dtype, device=device) for _ in range(num_layers)])
         self.final_layer = FinalLayer(hidden_size, time_embed_dim, video_dim, audio_latents_dim,
                                       final_norm_eps, **curve, dtype=dtype, device=device)
         fp32_modules = [self.video_patch_proj, self.audio_patch_proj, self.final_layer.video_out, self.final_layer.audio_out]
@@ -391,19 +472,21 @@ class MiniMaxH3Model(nn.Module):
 
     def _layout(self, text_tags, latent_t, latent_h, latent_w, audio_t, payload):
         signature = (text_tags.numel(), latent_t, latent_h, latent_w, audio_t,
+                     payload["fps"],
                      tuple(k["resolved_frame_index"] for k in payload.get("keyframes") or ()),
                      tuple((r["kind"], r.get("latent_t"), r.get("latent_h"), r.get("latent_w"), r.get("ref_audio_t"))
                            for r in payload.get("refs") or ()))
         if payload.get("layout_signature") == signature:
             return payload["layout"]
         with torch.device("cpu"):
+            video_time_scale = 24.0 / payload["fps"]
             if payload.get("refs"):
                 layout = build_ref2va_packed_sequence(text_tags, _prepared_references(payload["refs"]), latent_t,
-                                                      latent_h, latent_w, audio_t, self.patch_size)
+                                                      latent_h, latent_w, audio_t, self.patch_size, video_time_scale)
             else:
                 anchors = tuple("first" if keyframe["resolved_frame_index"] == 0 else "last"
                                 for keyframe in payload.get("keyframes") or ())
-                layout = build_packed_sequence(text_tags, latent_t, latent_h, latent_w, audio_t, self.patch_size, anchors)
+                layout = build_packed_sequence(text_tags, latent_t, latent_h, latent_w, audio_t, self.patch_size, anchors, video_time_scale)
         payload["layout_signature"], payload["layout"] = signature, layout
         return layout
 
@@ -415,7 +498,7 @@ class MiniMaxH3Model(nn.Module):
         lower = position.floor().long().clamp(max=table.shape[0] - 2)
         return torch.lerp(table[lower], table[lower + 1], (position - lower).unsqueeze(1))
 
-    def forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload, spectrum=None):
+    def forward(self, video_x, audio_x, sigma_video, sigma_audio, context, payload, spectrum=None, first_block_cache=None):
         device, dtype = video_x.device, self.dtype or next(self.blocks.parameters()).dtype
         video_dtype, audio_dtype = video_x.dtype, audio_x.dtype
         _, _, latent_t, latent_h, latent_w = video_x.shape
@@ -491,17 +574,31 @@ class MiniMaxH3Model(nn.Module):
             payload["rope"] = rope
             del positions, frequencies
         del adaln_indices, changes
-
-        for block in self.blocks:
-            self._check_interrupt()
-            h_list = [hidden]
-            hidden = None
-            hidden = block(h_list, temb, segments, rope)
-
         target_video_rows = latent_t * (latent_h // self.patch_size[1]) * (latent_w // self.patch_size[2])
         target_audio_rows = audio_t * 2
         video_start = layout.sequence_length - target_video_rows
         audio_start = video_start - target_audio_rows
+        self.sol_attention.begin_forward(layout, device, dtype)
+
+        if first_block_cache is None:
+            for block in self.blocks:
+                self._check_interrupt()
+                h_list = [hidden]
+                hidden = None
+                hidden = block(h_list, temb, segments, rope)
+        else:
+            self._check_interrupt()
+            hidden, signature = self.blocks[0]([hidden], temb, segments, rope,
+                                                residual_signature_elements=first_block_cache.MAX_SIGNATURE_ELEMENTS)
+            if first_block_cache.should_compute(signature):
+                head_output = first_block_cache.capture_head_output(hidden[audio_start:])
+                for block_index in range(1, len(self.blocks)):
+                    self._check_interrupt()
+                    hidden = self.blocks[block_index]([hidden], temb, segments, rope)
+                first_block_cache.store_tail_residual(hidden[audio_start:], head_output)
+            else:
+                first_block_cache.apply_tail_residual(hidden[audio_start:])
+
         video_row = int(timestep_indices[video_start])
         audio_row = int(timestep_indices[audio_start])
         if spectrum is not None:
