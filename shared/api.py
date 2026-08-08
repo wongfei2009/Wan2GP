@@ -658,6 +658,57 @@ class WanGPSession:
             record.update({"size_bytes": os.path.getsize(local_path), "already_existed": False})
         return record
 
+    def generate_mask(self, image: str, keywords: str, *, negative: bool = False, fill_holes: bool = True) -> dict[str, Any]:
+        from shared import magic_mask
+        from shared.utils.download import process_files_def
+        from shared.utils.process_locks import acquire_GPU_ressources, release_GPU_ressources
+
+        parsed_keywords = magic_mask.parse_keywords(keywords)
+        if len(parsed_keywords) == 0:
+            raise ValueError("keywords must contain at least one keyword")
+        if self._output_dir is None:
+            raise RuntimeError("This session has no output directory; masks cannot be saved")
+        # Fail fast rather than block: acquire_GPU_ressources would wait out a whole
+        # video job and the MCP request would just hang.
+        with self._job_lock:
+            if self._active_job is not None and not self._active_job.done:
+                raise RuntimeError("WanGP session already has a generation in progress")
+        output_root = os.path.realpath(str(self._output_dir))
+        source_path = os.path.realpath(os.path.join(output_root, str(image)))
+        # The MCP server has no auth; never let this become an arbitrary-file reader.
+        if not source_path.startswith(output_root + os.sep):
+            raise ValueError(f"'{image}' escapes the output directory")
+        if not os.path.isfile(source_path):
+            raise ValueError(f"Image not found: {image}")
+        runtime = self._ensure_runtime()
+        with _pushd(runtime.root):
+            process_files_def(**magic_mask.query_download_def())
+            acquire_GPU_ressources(self._state, magic_mask.PROCESS_ID, magic_mask.PROCESS_NAME)
+            try:
+                # generate_image_mask builds its own SAM3 predictor and shuts it down
+                # (weights back to CPU + empty cache) before returning, so the next
+                # generation does not inherit a SAM3-sized hole in VRAM.
+                _, mask_image, used_keywords = magic_mask.generate_image_mask(
+                    source_path,
+                    keywords,
+                    no_hole=bool(fill_holes),
+                    negative_mask=bool(negative),
+                )
+            finally:
+                release_GPU_ressources(self._state, magic_mask.PROCESS_ID)
+        stem = Path(source_path).stem
+        suffix = magic_mask.truncate_keywords_for_path(used_keywords)
+        name = f"{stem}_mask_{suffix}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        mask_path = Path(output_root) / name
+        mask_image.save(mask_path)
+        return {
+            "mask": str(mask_path.resolve()),
+            "keywords": used_keywords,
+            "negative": bool(negative),
+            "width": mask_image.width,
+            "height": mask_image.height,
+        }
+
     def submit(self, source: str | os.PathLike[str] | dict[str, Any] | list[dict[str, Any]], callbacks: object | None = None) -> SessionJob:
         tasks = self._normalize_source(source, caller_base_path=self._get_caller_base_path())
         return self._submit_tasks(tasks, callbacks=callbacks)

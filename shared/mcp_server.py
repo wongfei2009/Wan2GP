@@ -313,6 +313,12 @@ def build_server(args: argparse.Namespace):
         return session.download_lora(url, model_type)
 
     @mcp.tool()
+    def wangp_generate_mask(image: str, keywords: str, negative: bool = False, fill_holes: bool = True) -> dict[str, Any]:
+        """Generate a black-and-white inpaint mask for an image from text keywords, using SAM3 (Magic Mask). image is a path relative to the outputs directory (upload it first); keywords are comma- or newline-separated ('crop top, leggings'). White = the matched objects, i.e. the region --image-mask regenerates. negative inverts the mask; fill_holes closes small holes. Returns the saved mask's absolute path. Model weights download on first use."""
+
+        return session.generate_mask(image, keywords, negative=negative, fill_holes=fill_holes)
+
+    @mcp.tool()
     def wangp_generate(source: dict[str, Any] | list[dict[str, Any]], wait: bool = False, timeout_s: float | None = None, event_limit: int = 20) -> dict[str, Any]:
         """Start a WanGP generation from a settings dict, task dict, or task list."""
 
