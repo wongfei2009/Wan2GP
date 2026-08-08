@@ -666,22 +666,29 @@ class WanGPSession:
         parsed_keywords = magic_mask.parse_keywords(keywords)
         if len(parsed_keywords) == 0:
             raise ValueError("keywords must contain at least one keyword")
-        if self._output_dir is None:
-            raise RuntimeError("This session has no output directory; masks cannot be saved")
         # Fail fast rather than block: acquire_GPU_ressources would wait out a whole
         # video job and the MCP request would just hang.
         with self._job_lock:
             if self._active_job is not None and not self._active_job.done:
                 raise RuntimeError("WanGP session already has a generation in progress")
-        output_root = os.path.realpath(str(self._output_dir))
-        source_path = os.path.realpath(os.path.join(output_root, str(image)))
-        # The MCP server has no auth; never let this become an arbitrary-file reader.
-        if not source_path.startswith(output_root + os.sep):
-            raise ValueError(f"'{image}' escapes the output directory")
-        if not os.path.isfile(source_path):
-            raise ValueError(f"Image not found: {image}")
         runtime = self._ensure_runtime()
         with _pushd(runtime.root):
+            # _output_dir is only set when the server was started with --output-dir;
+            # otherwise images land in the runtime's own image_save_path, the same
+            # directory the file server serves.
+            output_dir = self._output_dir if self._output_dir is not None else getattr(runtime.module, "image_save_path", None) or "outputs"
+            output_root = os.path.realpath(str(output_dir))
+            # Callers name uploads the way every other attachment does — relative to
+            # the WanGP root, e.g. "outputs/<name>" — so resolve from cwd, not from
+            # output_root, or the outputs segment gets doubled.
+            source_path = os.path.realpath(str(image))
+            # The MCP server has no auth; never let this become an arbitrary-file reader.
+            # normcase so the check holds on Windows, where the two paths can reach
+            # realpath with different casing.
+            if not os.path.normcase(source_path).startswith(os.path.normcase(output_root + os.sep)):
+                raise ValueError(f"'{image}' is outside the outputs directory")
+            if not os.path.isfile(source_path):
+                raise ValueError(f"Image not found: {image}")
             process_files_def(**magic_mask.query_download_def())
             acquire_GPU_ressources(self._state, magic_mask.PROCESS_ID, magic_mask.PROCESS_NAME)
             try:
