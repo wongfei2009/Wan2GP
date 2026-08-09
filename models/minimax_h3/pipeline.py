@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from mmgp import offload
 from shared.utils.text_encoder_cache import TextEncoderCache
-from shared.utils.frame_scheduler import floor_frame_count, normalize_frame_count
+from shared.utils.frame_scheduler import floor_frame_count, normalize_frame_count, normalize_overlap
 from .first_block_cache import MiniMaxH3FirstBlockCache
 from .interrupt import GenerationInterrupted
 from .spectrum import MiniMaxH3Spectrum
@@ -97,6 +97,33 @@ def _reinject_video_source(video, source, noise, editable_mask, sigma, buffer):
         video.copy_(buffer)
     else:
         video.lerp_(buffer, 1.0 - editable_mask)
+
+
+def _res_multistep_coefficients(sigmas):
+    """Precompute deterministic second-order RES weights (arXiv:2308.02157)."""
+    values = [float(sigma) for sigma in sigmas]
+    coefficients = []
+    old_sigma_down = None
+    for index, (sigma, sigma_next) in enumerate(zip(values, values[1:])):
+        if old_sigma_down is None or sigma_next == 0.0:
+            ratio = sigma_next / sigma
+            coefficients.append((ratio, 1.0 - ratio, 0.0))
+        else:
+            t = -math.log(sigma)
+            h = -math.log(sigma_next) - t
+            c2 = (-math.log(values[index - 1]) + math.log(old_sigma_down)) / h
+            phi1 = math.expm1(-h) / -h
+            phi2 = (phi1 - 1.0) / -h
+            coefficients.append((math.exp(-h), h * (phi1 - phi2 / c2), h * phi2 / c2))
+        old_sigma_down = sigma_next
+    return coefficients
+
+
+def _res_multistep_update(sample, denoised, old_denoised, coefficients):
+    sample_coefficient, denoised_coefficient, old_denoised_coefficient = coefficients
+    sample.mul_(sample_coefficient).add_(denoised, alpha=denoised_coefficient)
+    if old_denoised_coefficient:
+        sample.add_(old_denoised, alpha=old_denoised_coefficient)
 
 
 def _resolve_canvas(width, height, short_edge, max_pixels=None):
@@ -328,17 +355,19 @@ class MiniMaxH3Pipeline:
         self._set_interrupt_state()
         self._check_abort()
         self._configure_tiling(VAE_tile_size)
-        if sample_solver != "euler":
-            raise ValueError("MiniMax H3 uses its released dual-schedule Euler sampler")
+        if sample_solver not in ("euler", "res_multistep"):
+            raise ValueError(f"Unsupported MiniMax H3 sampler {sample_solver!r}")
         if int(sampling_steps) < 1:
             raise ValueError("MiniMax H3 requires at least one inference step")
         frame_num = normalize_frame_count(int(frame_num), 5, 17, 5)
         audio_from_control_video = not self.reference_mode and "2" in (audio_prompt_type or "")
-        prefix_frames_count = int(prefix_frames_count or 0)
+        prefix_frames_count, overlap_error = normalize_overlap(int(prefix_frames_count or 0), 17, 1)
+        if overlap_error:
+            raise ValueError(overlap_error)
         continuation = _as_video(input_video) if input_video is not None and prefix_frames_count > 0 else None
         continuation_count = min(prefix_frames_count, continuation.shape[1]) if continuation is not None and image_start is None else 0
-        if continuation_count and (continuation_count - 1) % 17:
-            raise ValueError(f"MiniMax H3 continuation overlap must contain 17k + 1 frames, got {continuation_count}")
+        if continuation_count and continuation_count < prefix_frames_count:
+            continuation_count = floor_frame_count(continuation_count, 1, 17, 1)
         frozen_control_video = (_build_frozen_control_video(input_frames, continuation, frame_num, continuation_count)
                                 if audio_from_control_video else None)
         if frozen_control_video is not None:
@@ -471,10 +500,12 @@ class MiniMaxH3Pipeline:
                    "target_video_condition_frames": target_video_condition_frames}
 
         base_sigmas = torch.linspace(1.0, 0.0, int(sampling_steps) + 1, dtype=torch.float32)
-        sigmas_video = torch.unique_consecutive(float(shift) * base_sigmas / (1.0 + (float(shift) - 1.0) * base_sigmas)).to(self.device)
-        sigmas_audio = torch.unique_consecutive(3.0 * base_sigmas / (1.0 + 2.0 * base_sigmas)).to(self.device)
+        sigmas_video = torch.unique_consecutive(float(shift) * base_sigmas / (1.0 + (float(shift) - 1.0) * base_sigmas))
+        sigmas_audio = torch.unique_consecutive(3.0 * base_sigmas / (1.0 + 2.0 * base_sigmas))
         if sigmas_video.shape != sigmas_audio.shape:
             raise ValueError("The selected H3 flow shift collapses a different number of video and audio schedule points")
+        res_coefficients = _res_multistep_coefficients(sigmas_video) if sample_solver == "res_multistep" else None
+        sigmas_video, sigmas_audio = sigmas_video.to(self.device), sigmas_audio.to(self.device)
         model_steps = sigmas_video.numel() - 1
         denoising_start_step = int(round(model_steps * (1.0 - float(denoising_strength)), 4))
         mask_end_step = min(model_steps, denoising_start_step + math.ceil(model_steps * float(masking_strength))) if editable_mask is not None else 0
@@ -483,6 +514,8 @@ class MiniMaxH3Pipeline:
         cache = self.transformer.cache
         spectrum = MiniMaxH3Spectrum(cache, sigmas_video[:-1]) if cache is not None and cache.cache_type == "spectrum" else None
         first_block_cache = MiniMaxH3FirstBlockCache(cache) if cache is not None and cache.cache_type == "first_block" else None
+        old_video_denoised = old_audio_denoised = None
+        audio_scale = float(shift) / 3.0
         try:
             for step in tqdm(range(model_steps), desc="H3 denoising"):
                 self._set_interrupt_state()
@@ -492,21 +525,35 @@ class MiniMaxH3Pipeline:
                     spectrum.begin_step(step)
                 if first_block_cache is not None:
                     first_block_cache.begin_step(step)
+                audio_tail = audio[..., target_audio_condition_latents:]
+                if res_coefficients is not None and audio_tail.shape[-1]:
+                    # RES carries generated audio on the video schedule; H3 still receives its native audio state.
+                    audio_tail.mul_(sigmas_audio[step] / sigmas_video[step])
                 video_velocity, audio_velocity = self.transformer(video, audio, sigmas_video[step:step + 1], sigmas_audio[step:step + 1], context, payload, spectrum=spectrum, first_block_cache=first_block_cache)
                 if spectrum is not None:
                     spectrum.finish_step()
-                video_sigma_from_t = 1.0 - (1.0 - sigmas_video[step])
-                video_ratio = sigmas_video[step + 1] / sigmas_video[step]
-                if not target_video_condition_frames:
-                    video_velocity.mul_(video_sigma_from_t).add_(video)
-                    video.mul_(video_ratio).add_(video_velocity, alpha=1.0 - video_ratio)
-                audio_sigma_from_t = 1.0 - (1.0 - sigmas_audio[step])
-                audio_ratio = sigmas_audio[step + 1] / sigmas_audio[step]
-                audio_tail = audio[..., target_audio_condition_latents:]
-                if audio_tail.shape[-1]:
-                    audio_velocity_tail = audio_velocity[..., target_audio_condition_latents:]
-                    audio_velocity_tail.mul_(audio_sigma_from_t).add_(audio_tail)
-                    audio_tail.mul_(audio_ratio).add_(audio_velocity_tail, alpha=1.0 - audio_ratio)
+                if res_coefficients is None:
+                    video_ratio = sigmas_video[step + 1] / sigmas_video[step]
+                    if not target_video_condition_frames:
+                        video_velocity.mul_(sigmas_video[step]).add_(video)
+                        video.mul_(video_ratio).add_(video_velocity, alpha=1.0 - video_ratio)
+                    audio_ratio = sigmas_audio[step + 1] / sigmas_audio[step]
+                    if audio_tail.shape[-1]:
+                        audio_velocity_tail = audio_velocity[..., target_audio_condition_latents:]
+                        audio_velocity_tail.mul_(sigmas_audio[step]).add_(audio_tail)
+                        audio_tail.mul_(audio_ratio).add_(audio_velocity_tail, alpha=1.0 - audio_ratio)
+                else:
+                    coefficients = res_coefficients[step]
+                    if not target_video_condition_frames:
+                        video_denoised = video_velocity.mul_(sigmas_video[step]).add_(video)
+                        _res_multistep_update(video, video_denoised, old_video_denoised, coefficients)
+                        old_video_denoised = video_denoised
+                    if audio_tail.shape[-1]:
+                        audio_velocity_tail = audio_velocity[..., target_audio_condition_latents:]
+                        audio_denoised = audio_velocity_tail.mul_(sigmas_audio[step]).add_(audio_tail).mul_(audio_scale)
+                        audio_tail.mul_(sigmas_video[step] / sigmas_audio[step])
+                        _res_multistep_update(audio_tail, audio_denoised, old_audio_denoised, coefficients)
+                        old_audio_denoised = audio_denoised
                 if source_latents is not None and (step < denoising_start_step or step < mask_end_step):
                     source_video = video[:, :, :source_latents.shape[2]]
                     source_mask = None if step < denoising_start_step else editable_mask
@@ -519,6 +566,10 @@ class MiniMaxH3Pipeline:
                 spectrum.reset()
             if first_block_cache is not None:
                 first_block_cache.reset()
+
+        if res_coefficients is not None:
+            audio[..., target_audio_condition_latents:].div_(audio_scale)
+        old_video_denoised = old_audio_denoised = None
 
         if set_progress_status is not None:
             set_progress_status("Decoding H3 stereo audio" if frozen_target_video is not None else "Decoding Video and Audio")
