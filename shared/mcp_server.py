@@ -343,6 +343,15 @@ def build_server(args: argparse.Namespace):
         record.job.cancel()
         return record.snapshot(event_limit=20)
 
+    # Fork-only: on HTTP transports, serve the outputs directory from this same
+    # process (/files/<relpath> download+listing, /files/upload multipart
+    # upload) so no separate file-server process is needed. See mcp_files.py.
+    if _normalize_transport(getattr(args, "transport", "stdio")) != "stdio":
+        from shared.mcp_files import register_file_routes
+
+        files_root = Path(args.output_dir) if args.output_dir else Path(args.root) / "outputs"
+        register_file_routes(mcp, files_root)
+
     return mcp
 
 

@@ -1,33 +1,28 @@
 @echo off
 REM ---------------------------------------------------------------------------
-REM WanGP MCP server launcher (+ outputs file server)
+REM WanGP MCP server launcher
 REM
-REM Starts two things, both bound to all interfaces (0.0.0.0):
-REM   1. WanGP MCP server (Streamable HTTP) on MCP_PORT
-REM        -> MCP client connects to:  http://%MCP_HOST%:%MCP_PORT%/mcp
-REM   2. An HTTP server for the WanGP outputs folder on HTTP_PORT, which both
-REM      serves generated media AND accepts uploads (for reference images).
-REM        -> download generated media : http://%MCP_HOST%:%HTTP_PORT%/<filename>
-REM        -> upload a reference image : POST http://%MCP_HOST%:%HTTP_PORT%/upload
-REM           (multipart field "files", no auth, lands in outputs\)
+REM ONE process serves everything, bound to all interfaces (0.0.0.0):
+REM   - MCP (Streamable HTTP):       http://%MCP_HOST%:%MCP_PORT%/mcp
+REM   - download generated media:    GET  http://%MCP_HOST%:%MCP_PORT%/files/<relpath>
+REM   - list a directory:            GET  http://%MCP_HOST%:%MCP_PORT%/files/  (plain text)
+REM   - upload a reference image:    POST http://%MCP_HOST%:%MCP_PORT%/files/upload
+REM       (multipart field "files", no auth, lands in outputs\)
 REM
-REM HTTP_PORT reuses the port web-ui.bat normally uses (Gradio default 7860),
-REM which is free in MCP mode since the web UI is not launched -- so no new
-REM firewall rule is needed beyond the one already covering that port.
+REM The file routes are served by the MCP server itself (fork-only,
+REM shared/mcp_files.py) -- the separate `uploadserver` process on port 7860
+REM that this script used to start is gone. Port 7860 stays free for
+REM web-ui.bat's Gradio UI.
 REM
 REM NOTE: No endpoint has authentication, including file UPLOADS -- anyone who
-REM can reach these ports can read outputs and write files into outputs\.
+REM can reach this port can read outputs and write files into outputs\.
 REM Binding 0.0.0.0 listens on ALL interfaces, so exposure is limited ONLY by
-REM your firewall scope -- make sure these ports are firewalled to the VPN/LAN.
-REM
-REM Two console windows open: this one (MCP server) and "WanGP Outputs HTTP".
-REM Close BOTH windows to fully stop the servers.
+REM your firewall scope -- make sure the port is firewalled to the VPN/LAN.
 REM ---------------------------------------------------------------------------
 
 REM Bind all interfaces (like web-ui.bat's --listen) so it's reachable on the LAN/VPN.
 set MCP_HOST=0.0.0.0
 set MCP_PORT=7866
-set HTTP_PORT=7860
 
 REM ---------------------------------------------------------------------------
 REM Memory tuning (this box: RTX 5080 16 GB VRAM, 64 GB system RAM)
@@ -78,9 +73,5 @@ call venv\Scripts\activate.bat
 REM Make sure the outputs folder exists before serving it
 if not exist outputs mkdir outputs
 
-REM Start the outputs file server (download + unauthenticated upload) in its own window.
-REM --allow-replace keeps the uploaded filename intact (so the agent can predict the path).
-start "WanGP Outputs HTTP" venv\Scripts\python.exe -m uploadserver %HTTP_PORT% --bind %MCP_HOST% --directory outputs --allow-replace
-
-REM Run the MCP server in the foreground (this window)
+REM Run the MCP server (which also serves /files/*) in the foreground
 python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --profile %PROFILE% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED%
