@@ -169,7 +169,7 @@ def _magic_mask_video_codec_params():
     return params
 
 
-def save_mask_video(video_path: str, masks: np.ndarray, fps: float, keywords: list[str], *, codec_type=None, output_dir=OUTPUT_DIR, abort_callback=None, background_color=None) -> str:
+def save_mask_video(video_path: str, masks: np.ndarray, fps: float, keywords: list[str], *, codec_type=None, output_dir=OUTPUT_DIR, abort_callback=None, background_color=None, filename_tag="magic_mask") -> str:
     # codec_type is kept for compatibility; Magic Mask outputs are always MP4 libx264_10.
     if masks.ndim == 4 and masks.shape[-1] == 3:
         mask_frames = masks.astype(np.uint8, copy=True)
@@ -181,7 +181,7 @@ def save_mask_video(video_path: str, masks: np.ndarray, fps: float, keywords: li
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     stem = Path(strip_virtual_media_suffix(video_path)).stem
     keywords_suffix = truncate_keywords_for_path(keywords)
-    output_path = Path(output_dir) / f"{sanitize_file_name(stem)}_magic_mask_{keywords_suffix}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    output_path = Path(output_dir) / f"{sanitize_file_name(stem)}_{filename_tag}_{keywords_suffix}_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
     output_path = os.fspath(output_path)
     writer = imageio.get_writer(output_path, fps=fps, ffmpeg_log_level="error", **_magic_mask_video_codec_params())
     try:

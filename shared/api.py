@@ -750,6 +750,109 @@ class WanGPSession:
             "height": mask_image.height,
         }
 
+    def _run_matanyone(self, frames, seed, *, version: str, erode: int, dilate: int, warmup: int):
+        import numpy as np
+        import torch
+
+        from preprocessing.matanyone.matanyone.inference.inference_core import InferenceCore
+        from preprocessing.matanyone.matanyone_wrapper import matanyone as run_matanyone
+        from preprocessing.matanyone.utils.model_assets import load_selected_matanyone_model
+
+        # Pin the version explicitly rather than reading the server config: the GUI's
+        # "Mask Generator Engine" dropdown can be set to SAM3, which is not a MatAnyone
+        # checkpoint at all and would raise on load. models/wan/scail pins it the same way.
+        model, _, _ = load_selected_matanyone_model({"matanyone_version": version})
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.eval().to(device)
+        try:
+            processor = InferenceCore(model, cfg=model.cfg)
+            _, phas = run_matanyone(processor, list(frames), seed, r_erode=int(erode), r_dilate=int(dilate), n_warmup=int(warmup))
+        finally:
+            # Hand the VRAM back before the next generation loads a model.
+            model.to("cpu")
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        # save_mask_video passes an (N,H,W,3) uint8 array through untouched; its other
+        # branch is for boolean masks and would multiply the alpha by 255 and wrap it.
+        return np.stack([np.repeat(np.asarray(pha, dtype=np.uint8), 3, axis=-1) for pha in phas], axis=0)
+
+    def generate_matte(self, video: str, *, keywords: str = "", seed_mask: str | None = None, matanyone_version: str = "v1", erode: int = 0, dilate: int = 0, warmup: int = 10, max_seconds: float | None = None, fill_holes: bool = True) -> dict[str, Any]:
+        import numpy as np
+        from PIL import Image
+
+        from shared import magic_mask
+        from shared.utils.download import process_files_def
+        from shared.utils.process_locks import acquire_GPU_ressources, release_GPU_ressources
+        from preprocessing.matanyone.utils.model_assets import MATANYONE_SAM3, normalize_matanyone_version
+
+        keywords = str(keywords or "").strip()
+        seed_mask = str(seed_mask or "").strip()
+        if bool(keywords) == bool(seed_mask):
+            raise ValueError("pass exactly one of keywords or seed_mask")
+        version = normalize_matanyone_version(matanyone_version)
+        if version == MATANYONE_SAM3:
+            raise ValueError("matanyone_version must be a MatAnyone checkpoint ('v1' or 'v2'); SAM3 is a separate engine -- use generate_mask for a binary mask")
+        # Fail fast rather than block: acquire_GPU_ressources would wait out a whole
+        # video job and the MCP request would just hang.
+        with self._job_lock:
+            if self._active_job is not None and not self._active_job.done:
+                raise RuntimeError("WanGP session already has a generation in progress")
+        runtime = self._ensure_runtime()
+        with _pushd(runtime.root):
+            output_dir = self._output_dir if self._output_dir is not None else getattr(runtime.module, "image_save_path", None) or "outputs"
+            output_root = os.path.realpath(str(output_dir))
+
+            # The MCP server has no auth; never let this become an arbitrary-file reader.
+            def _inside_outputs(path: str, label: str) -> str:
+                resolved = os.path.realpath(str(path))
+                if not os.path.normcase(resolved).startswith(os.path.normcase(output_root + os.sep)):
+                    raise ValueError(f"'{path}' is outside the outputs directory")
+                if not os.path.isfile(resolved):
+                    raise ValueError(f"{label} not found: {path}")
+                return resolved
+
+            source_path = _inside_outputs(video, "Video")
+            seed_path = _inside_outputs(seed_mask, "Seed mask") if seed_mask else ""
+
+            video_path, frames, fps = magic_mask.prepare_video_mask_input(source_path, max_time_seconds=max_seconds)
+            height, width = int(frames.shape[1]), int(frames.shape[2])
+
+            if keywords:
+                process_files_def(**magic_mask.query_download_def())
+            acquire_GPU_ressources(self._state, "matanyone", "MatAnyone")
+            try:
+                if keywords:
+                    # Seed from frame 0 only: MatAnyone propagates forward from the seed,
+                    # so running SAM3 over the whole clip would be work thrown away.
+                    used_keywords = magic_mask.parse_keywords(keywords)
+                    seeded = magic_mask.generate_keyword_masks(frames[:1], keywords, no_hole=bool(fill_holes))
+                    seed = np.asarray(seeded[0]).astype(bool).astype(np.uint8) * 255
+                else:
+                    used_keywords = [Path(seed_path).stem]
+                    seed_image = Image.open(seed_path).convert("L")
+                    if seed_image.size != (width, height):
+                        seed_image = seed_image.resize((width, height), resample=Image.Resampling.NEAREST)
+                    # The wrapper's erode/dilate compare against 0 and 255 exactly, so an
+                    # anti-aliased or grey seed has to be thresholded, never rescaled.
+                    seed = (np.asarray(seed_image) > 127).astype(np.uint8) * 255
+                if not seed.any():
+                    raise ValueError("the seed mask is empty -- nothing to propagate")
+                matte = self._run_matanyone(frames, seed, version=version, erode=erode, dilate=dilate, warmup=warmup)
+            finally:
+                release_GPU_ressources(self._state, "matanyone")
+
+            matte_path = magic_mask.save_mask_video(video_path, matte, fps, used_keywords, output_dir=output_root, filename_tag="matte")
+        return {
+            "matte": str(Path(matte_path).resolve()),
+            "keywords": used_keywords,
+            "matanyone_version": version,
+            "frames": int(matte.shape[0]),
+            "fps": float(fps),
+            "width": width,
+            "height": height,
+        }
+
     def submit(self, source: str | os.PathLike[str] | dict[str, Any] | list[dict[str, Any]], callbacks: object | None = None) -> SessionJob:
         tasks = self._normalize_source(source, caller_base_path=self._get_caller_base_path())
         return self._submit_tasks(tasks, callbacks=callbacks)

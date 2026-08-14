@@ -325,6 +325,12 @@ def build_server(args: argparse.Namespace):
         return session.generate_mask(image, keywords, negative=negative, fill_holes=fill_holes)
 
     @mcp.tool()
+    def wangp_generate_matte(video: str, keywords: str = "", seed_mask: str | None = None, matanyone_version: str = "v1", erode: int = 0, dilate: int = 0, warmup: int = 10, max_seconds: float | None = None, fill_holes: bool = True) -> dict[str, Any]:
+        """Generate a soft alpha matte video for a clip, using MatAnyone. video (and seed_mask) are paths relative to the outputs directory (upload first). Seed with exactly one of: keywords (SAM3 segments frame 0) or seed_mask (a black-and-white PNG). MatAnyone then propagates that seed forward with continuous alpha -- soft edges on hair and motion blur, temporally stable, but it never picks up a subject entering later; use generate_mask for per-frame re-detection. matanyone_version is 'v1' (default, generally preferred) or 'v2'. erode/dilate adjust the seed; warmup primes memory on frame 0. max_seconds caps a long clip. Returns the saved matte's absolute path. Weights download on first use."""
+
+        return session.generate_matte(video, keywords=keywords, seed_mask=seed_mask, matanyone_version=matanyone_version, erode=erode, dilate=dilate, warmup=warmup, max_seconds=max_seconds, fill_holes=fill_holes)
+
+    @mcp.tool()
     def wangp_generate(source: dict[str, Any] | list[dict[str, Any]], wait: bool = False, timeout_s: float | None = None, event_limit: int = 20) -> dict[str, Any]:
         """Start a WanGP generation from a settings dict, task dict, or task list."""
 
