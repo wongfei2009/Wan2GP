@@ -35,9 +35,13 @@ REM while VAE-encoding a reference image. So the knob that actually matters here
 REM is VRAM_SAFETY, not PERC_RESERVED.
 REM
 REM   VRAM_SAFETY    Fraction of VRAM mmgp may fill with preloaded model weights
-REM                  (wgp.py default 0.8 -> up to ~12.8 GB of a 16 GB card, which
-REM                  leaves too little for activations). Lower = more headroom.
-REM                  If a model still OOMs, step down: 0.5 -> 0.4 -> 0.3.
+REM                  (0.8 -> ~12.8 GB of a 16 GB card; 0.5 -> ~8 GB). It is a
+REM                  TRADE, not a safety dial: higher keeps more weights resident
+REM                  (faster, and essential when one component must not stream),
+REM                  lower leaves more room for activations (survives big VAE
+REM                  encodes). Video wants it LOW, audio wants it HIGH -- see the
+REM                  per-model box below. If a model OOMs, step down:
+REM                  0.8 -> 0.5 -> 0.35 -> 0.3.
 REM
 REM   PERC_RESERVED  Fraction of system RAM pinned for fast RAM->VRAM transfers.
 REM                  Default 0 = auto, which topped out near 25 GB and left the
@@ -58,13 +62,30 @@ REM `&&` into the value:
 REM   set "VRAM_SAFETY=0.35" && mcp-server.bat
 REM ...or just set it on its own line first, then run the script.
 REM
-REM Known-good values on this box:
-REM   Pruned 20B (fl2va/ref2va_pruned) ... VRAM_SAFETY=0.5  works
-REM   Full 33B   (fl2va/ref2va)        ... needs LOWER; 0.5 OOMs in the VAE
-REM                                        encode. Try 0.35, then 0.3, then
-REM                                        PROFILE=5.
+REM ###########################################################################
+REM #  DEFAULT IS 0.8 (wgp.py's own default) -- TUNED FOR AUDIO, *NOT* VIDEO. #
+REM #  MiniMax H3 VIDEO WILL OOM AT THIS DEFAULT. Override it per launch:     #
+REM #                                                                         #
+REM #    H3 Pruned 20B (fl2va/ref2va_pruned) .. set "VRAM_SAFETY=0.5"         #
+REM #    H3 Full 33B   (fl2va/ref2va) ........ set "VRAM_SAFETY=0.35"         #
+REM #                                          then 0.3, then PROFILE=5       #
+REM #    MiniMax Music 3 / audio ............. 0.8 (the default) -- see below #
+REM #                                                                         #
+REM #  e.g.  set "VRAM_SAFETY=0.5" && mcp-server.bat                          #
+REM ###########################################################################
+REM
+REM Why 0.8 for MiniMax Music 3: its bottleneck is an autoregressive Qwen3 stage
+REM that runs one decode step per audio frame (25 fps -> 3000 steps for a 2 min
+REM song). That encoder is 10.2 GB even at int8, so at VRAM_SAFETY=0.5 (~8 GB of
+REM preloaded weights on this 16 GB card) it cannot stay resident and streams
+REM from system RAM on EVERY step. 0.8 (~12.8 GB) is enough to hold it. The H3
+REM reason for lowering the knob -- an OOM while VAE-encoding a reference image
+REM -- does not apply to music: there is no image VAE encode on that path.
+REM
+REM Measured before this change (VRAM_SAFETY=0.5): ~32.6 s of GPU per 1 s of
+REM song, linear -- 30 s took ~17.5 min, 120 s took 1h08m. Re-measure after.
 REM ---------------------------------------------------------------------------
-if "%VRAM_SAFETY%"==""   set VRAM_SAFETY=0.5
+if "%VRAM_SAFETY%"==""   set VRAM_SAFETY=0.8
 if "%PERC_RESERVED%"=="" set PERC_RESERVED=0.45
 if "%PROFILE%"==""       set PROFILE=4
 
