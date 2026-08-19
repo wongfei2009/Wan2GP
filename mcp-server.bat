@@ -14,6 +14,18 @@ REM shared/mcp_files.py) -- the separate `uploadserver` process on port 7860
 REM that this script used to start is gone. Port 7860 stays free for
 REM web-ui.bat's Gradio UI.
 REM
+REM --mcp-allow-read-file-system is REQUIRED for the `wangp` CLI, as of WanGP
+REM 12.60. Upstream now routes every generation through _resolve_generation_media
+REM and rejects filesystem paths by default, for every attachment key the CLI
+REM sends (image_start/end, image_refs, image_guide/mask, video_guide/guide2/
+REM mask/source, audio_guide/guide2/source, ...) -- without the flag each one
+REM fails with "Direct filesystem paths are disabled". The sanctioned
+REM alternatives (Gallery ids, the wangp_create_gallery_upload PUT-URL flow) are
+REM not what the CLI speaks. Paths arrive relative (outputs\<name>) and resolve
+REM against THIS process's CWD, i.e. the repo root -- so run the .bat from here.
+REM The flag also enables wangp_list_files / wangp_query_file, i.e. arbitrary
+REM server-file reads, so it widens the same no-auth exposure as the note below.
+REM
 REM NOTE: No endpoint has authentication, including file UPLOADS -- anyone who
 REM can reach this port can read outputs and write files into outputs\.
 REM Binding 0.0.0.0 listens on ALL interfaces, so exposure is limited ONLY by
@@ -95,4 +107,4 @@ REM Make sure the outputs folder exists before serving it
 if not exist outputs mkdir outputs
 
 REM Run the MCP server (which also serves /files/*) in the foreground
-python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --profile %PROFILE% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED%
+python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --mcp-allow-read-file-system --profile %PROFILE% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED%
