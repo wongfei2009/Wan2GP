@@ -1407,12 +1407,6 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         return session.download_lora(url, model_type)
 
     @mcp.tool()
-    def wangp_list_profiles(model_type: str) -> dict[str, Any]:
-        """List the model's built-in settings profiles (accelerator profiles + presets — the GUI Settings dropdown): name, group, and each profile's raw settings JSON. Apply one by merging its settings as a base layer under explicit overrides."""
-
-        return session.list_profiles(model_type)
-
-    @mcp.tool()
     def wangp_generate_mask(image: str, keywords: str, negative: bool = False, fill_holes: bool = True) -> dict[str, Any]:
         """Generate a black-and-white inpaint mask for an image from text keywords, using SAM3 (Magic Mask). image is a path relative to the outputs directory (upload it first); keywords are comma- or newline-separated ('crop top, leggings'). White = the matched objects, i.e. the region --image-mask regenerates. negative inverts the mask; fill_holes closes small holes. Returns the saved mask's absolute path. Model weights download on first use."""
 

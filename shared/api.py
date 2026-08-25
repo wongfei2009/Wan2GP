@@ -885,40 +885,6 @@ class WanGPSession:
             record.update({"size_bytes": os.path.getsize(local_path), "already_existed": False})
         return record
 
-    def list_profiles(self, model_type: str) -> dict[str, Any]:
-        """List the model's built-in settings profiles (the GUI Settings dropdown).
-
-        Covers both dropdown groups — accelerator profiles (model_def
-        `profiles_dir`) and preset settings (`preset_profiles_dir`) — using the
-        same discovery as the GUI (`wgp._get_builtin_lset_groups`). Returns each
-        profile's raw settings JSON verbatim; clients merge it as a base layer
-        under their own overrides.
-        """
-
-        if self.get_model_def(model_type) is None:
-            raise ValueError(f"Unknown model_type: {model_type}")
-        runtime = self._ensure_runtime()
-        records: list[dict[str, Any]] = []
-        with _pushd(runtime.root):
-            for group_id, _title, paths in runtime.module._get_builtin_lset_groups(model_type):
-                for choice_path in paths:
-                    file_path = runtime.module._builtin_lset_file_path(choice_path)
-                    record: dict[str, Any] = {
-                        "name": os.path.splitext(os.path.basename(choice_path))[0],
-                        "group": group_id,
-                        "file": choice_path.replace(os.sep, "/"),
-                    }
-                    try:
-                        with open(file_path, "r", encoding="utf-8") as reader:
-                            settings = json.load(reader)
-                        if not isinstance(settings, dict):
-                            raise ValueError("profile JSON is not an object")
-                        record["settings"] = settings
-                    except Exception as exc:  # a broken profile shouldn't hide the rest
-                        record["error"] = str(exc)
-                    records.append(record)
-        return {"model_type": str(model_type), "profiles": records}
-
     def generate_mask(self, image: str, keywords: str, *, negative: bool = False, fill_holes: bool = True) -> dict[str, Any]:
         from shared import magic_mask
         from shared.utils.download import process_files_def
