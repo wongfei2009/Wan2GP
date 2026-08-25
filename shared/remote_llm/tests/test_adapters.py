@@ -17,6 +17,7 @@ from PIL import Image
 from shared.cli_args import parse_wgp_args
 from shared.llm_io import configure_llm_io, get_llm_io_path, log_llm_io
 from shared.deepy.engine import AssistantSessionState, begin_assistant_turn, clear_assistant_session
+from shared.deepy.filesystem import FileAccessPolicy
 from shared.gradio import assistant_chat
 from shared.remote_llm.codex_backend import CodexAuthenticationRequired, CodexBackend, _codex_launch_command, _resolve_codex_executable
 from shared.remote_llm.claude_backend import CLAUDE_PROGRESS_INSTRUCTIONS, ClaudeAuthenticationRequired, ClaudeBackend, _resolve_claude_executable
@@ -26,6 +27,7 @@ from shared.remote_llm.opencode_backend import OpenCodeBackend
 from shared.remote_llm.base import BackendEvent
 from shared.remote_llm.deepy_runner import _visual_query, run_remote_deepy_turn
 from shared.remote_llm.usage import build_remote_usage_stats, claude_context_window
+from shared.prompt_enhancer.qwen35_assistant_runtime import extract_tool_calls
 
 
 class _ClosableBackend:
@@ -135,6 +137,20 @@ class _FakeToolbox:
 
 
 class RemoteLLMAdapterTests(unittest.TestCase):
+    def test_local_tool_parser_keeps_xml_like_prompt_tags_inside_source(self):
+        source = {"model_type": "minimax_h3", "prompt": "<Subject 1> speaks. <d>[English] Hello.</d> <action>waves</action> <wait>true</wait>"}
+        raw = "\n".join(("<tool_call>", "<function=wangp_generate>", f"<parameter=source>{json.dumps(source)}</parameter>", "</function>", "</tool_call>"))
+        self.assertEqual(extract_tool_calls(raw, {"wangp_generate": {"source", "wait"}}), [{"name": "wangp_generate", "arguments": {"source": source}}])
+
+    def test_local_tool_parser_does_not_promote_unwrapped_prompt_tags(self):
+        raw = "<tool_call><function=wangp_generate><d>[English] Hello.</d><parameter=wait>true</parameter></function></tool_call>"
+        self.assertEqual(extract_tool_calls(raw, {"wangp_generate": {"source", "wait"}}), [{"name": "wangp_generate", "arguments": {"wait": True}}])
+
+    def test_local_tool_parser_accepts_known_generic_parameters_only(self):
+        source = {"model_type": "minimax_h3", "prompt": "<d>[English] Hello.</d>"}
+        raw = f"<tool_call><function=wangp_generate><source>{json.dumps(source)}</source><d>wrong</d><wait>true</wait></function></tool_call>"
+        self.assertEqual(extract_tool_calls(raw, {"wangp_generate": {"source", "wait"}}), [{"name": "wangp_generate", "arguments": {"source": source, "wait": True}}])
+
     def test_plain_text_llm_io_log_uses_readable_directions_and_numeric_token_ids(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = configure_llm_io(temp_dir)
@@ -201,6 +217,39 @@ class RemoteLLMAdapterTests(unittest.TestCase):
         self.assertEqual(result["answer"], "Inspected.")
         self.assertEqual(submitted_sizes, [(1024, 512)])
         self.assertIn("Visual 1: image Wide.", backend.one_shot.call_args.args[0])
+
+    def test_remote_visual_query_exposes_only_the_virtual_media_path(self):
+        backend = Mock()
+        backend.one_shot.return_value = "Inspected."
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "private" / "wide.png"
+            source.parent.mkdir()
+            Image.new("RGB", (8, 8), "red").save(source)
+            policy = FileAccessPolicy(mode="read", output_roots=(Path(temp_dir).resolve(),))
+            record = {"media_id": "image_1", "media_type": "image", "path": str(source), "label": f"Source {source}"}
+            with patch("shared.remote_llm.deepy_runner.resolve_role_engine", return_value="codex"), patch("shared.remote_llm.deepy_runner.is_remote_engine", return_value=True), patch("shared.remote_llm.deepy_runner.create_backend", return_value=backend):
+                result = _visual_query({}, record, "What is shown?", file_access_policy=policy)
+
+        submitted_question = backend.one_shot.call_args.args[0]
+        self.assertIn("@outputs/private/wide.png", submitted_question)
+        self.assertNotIn(str(source), submitted_question)
+        self.assertEqual(result["path"], "@outputs/private/wide.png")
+
+    def test_remote_visual_query_uses_media_id_outside_virtual_roots(self):
+        backend = Mock()
+        backend.one_shot.return_value = "Inspected."
+        with tempfile.TemporaryDirectory() as output_dir, tempfile.TemporaryDirectory() as gallery_dir:
+            source = Path(gallery_dir) / "upload.png"
+            Image.new("RGB", (8, 8), "red").save(source)
+            policy = FileAccessPolicy(mode="read", output_roots=(Path(output_dir).resolve(),))
+            record = {"media_id": "image_7", "media_type": "image", "path": str(source), "label": "Upload"}
+            with patch("shared.remote_llm.deepy_runner.resolve_role_engine", return_value="codex"), patch("shared.remote_llm.deepy_runner.is_remote_engine", return_value=True), patch("shared.remote_llm.deepy_runner.create_backend", return_value=backend):
+                result = _visual_query({}, record, "What is shown?", file_access_policy=policy)
+
+        submitted_question = backend.one_shot.call_args.args[0]
+        self.assertIn("image_7", submitted_question)
+        self.assertNotIn(str(source), submitted_question)
+        self.assertEqual(result["path"], "image_7")
 
     def test_remote_visual_query_leaves_active_event_loop_before_starting_backend(self):
         backend = Mock()

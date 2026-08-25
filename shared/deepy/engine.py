@@ -22,8 +22,6 @@ from shared.llm_io import known_token_ids, llm_io_enabled, log_llm_io, media_des
 from shared.utils.audio_video import extract_audio_tracks
 from shared.utils.utils import get_video_info
 from shared.deepy.config import (
-    DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT,
-    DEEPY_ALLOW_READ_FILE_SYSTEM_KEY,
     DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT,
     DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY,
     DEEPY_COMPACTION_SUMMARIZE_MIN_TOKENS,
@@ -36,7 +34,6 @@ from shared.deepy.config import (
     DEEPY_VRAM_MODE_UNLOAD,
     DEEPY_VRAM_MODE_UNLOAD_ON_REQUEST,
     get_deepy_config_value,
-    normalize_deepy_allow_read_file_system,
     normalize_deepy_auto_cancel_queue_tasks,
     normalize_deepy_compaction_type,
     normalize_deepy_context_tokens,
@@ -425,6 +422,7 @@ class AssistantSessionState:
     runtime_max_model_len: int = 0
     chat_stats_signature: str = ""
     remote_usage_stats: dict[str, Any] | None = None
+    file_access_policy: Any | None = None
     seen_video_gallery_paths: list[str] = field(default_factory=list)
     seen_audio_gallery_paths: list[str] = field(default_factory=list)
     generated_client_ids: list[str] = field(default_factory=list)
@@ -2072,6 +2070,15 @@ class DeepyZeroTools:
             raise RuntimeError(f"Output file was not created: {output_path}")
         if not callable(self.record_file_metadata):
             raise RuntimeError("WanGP direct media recording is not available.")
+        self._trim_gallery_history(audio_only)
+        if persist_metadata:
+            self.record_file_metadata(output_path, settings, is_image, audio_only, self.gen)
+        else:
+            self.record_file_metadata(output_path, settings, is_image, audio_only, self.gen, notify_generation=False, write_metadata=False, record_notification=False)
+        self.send_cmd("refresh_gallery", {"path": output_path})
+        return self._register_tool_media(output_path, settings, label=label)
+
+    def _trim_gallery_history(self, audio_only: bool) -> None:
         path_key, settings_key, selection_key = ("audio_file_list", "audio_file_settings_list", "audio_selected") if audio_only else ("file_list", "file_settings_list", "selected")
         paths = list(self.gen.get(path_key, []))
         saved_settings = list(self.gen.get(settings_key, []))
@@ -2080,17 +2087,36 @@ class DeepyZeroTools:
         self.gen[path_key] = paths[keep_from:]
         self.gen[settings_key] = saved_settings[keep_from:]
         self.gen[selection_key] = max(int(self.gen.get(selection_key, 0)) - keep_from, 0)
-        self.record_file_metadata(output_path, settings if persist_metadata else None, is_image, audio_only, self.gen)
-        self.send_cmd("refresh_gallery", {"path": output_path})
-        return self._register_tool_media(output_path, settings, label=label)
+
+    @staticmethod
+    def _read_media_settings(path: str, media_type: str) -> dict[str, Any]:
+        try:
+            if media_type == "image":
+                from shared.utils.audio_video import read_image_metadata
+
+                settings = read_image_metadata(path)
+            elif media_type == "video":
+                from shared.utils.video_metadata import read_metadata_from_video
+
+                settings = read_metadata_from_video(path)
+            else:
+                from shared.utils.audio_metadata import read_audio_metadata
+
+                settings = read_audio_metadata(path)
+        except (OSError, TypeError, ValueError):
+            settings = None
+        return dict(settings) if isinstance(settings, dict) else {}
 
     def _server_config(self) -> dict[str, Any]:
         if callable(self.get_server_config):
             return dict(self.get_server_config() or {})
         return {}
 
+    def _file_access_policy(self):
+        return deepy_filesystem.build_file_access_policy(self._server_config())
+
     def _file_system_read_enabled(self) -> bool:
-        return normalize_deepy_allow_read_file_system(self._server_config().get(DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT))
+        return self._file_access_policy().read_enabled
 
     def _tool_enabled(self, metadata: dict[str, Any]) -> bool:
         return not metadata.get("requires_file_system", False) or self._file_system_read_enabled()
@@ -2129,9 +2155,12 @@ class DeepyZeroTools:
         gallery_path = self._resolve_gallery_media_path(lookup)
         if gallery_path:
             return media_registry.register_media(self.session, gallery_path, source="gallery")
-        candidate = Path(lookup).expanduser()
-        if self._file_system_read_enabled() and candidate.suffix and candidate.is_file():
-            return media_registry.register_media(self.session, str(candidate.resolve()), source="filesystem")
+        if Path(lookup).suffix:
+            try:
+                candidate = self._file_access_policy().require_read(lookup, file=True)
+            except (FileNotFoundError, PermissionError, ValueError):
+                return None
+            return media_registry.register_media(self.session, str(candidate), source="filesystem")
         return None
 
     def _get_video_output_settings(self) -> tuple[str, str]:
@@ -3376,6 +3405,91 @@ class DeepyZeroTools:
         return result
 
     @assistant_tool(
+        display_name="Add to Gallery",
+        description="Add existing media to WanGP Galleries without duplicates. Provide path or paths.",
+        parameters={
+            "path": {"type": "string", "description": "One media id or authorized path, including an output_file returned by another action.", "required": False},
+            "paths": {"type": "array", "items": {"type": "string"}, "maxItems": 50, "description": "Up to 50 media ids or authorized paths, including output_file values returned by other actions.", "required": False},
+        },
+        pause_runtime=False,
+    )
+    def add_to_gallery(self, path: str | None = None, paths: list[str] | None = None) -> dict[str, Any]:
+        inputs = ([path] if str(path or "").strip() else []) + (list(paths) if isinstance(paths, list) else [])
+        if not inputs:
+            return {"status": "error", "items": [], "paths": [], "media_ids": [], "added": 0, "already_present": 0, "failed": 0, "error": "path or paths is required."}
+        if len(inputs) > 50:
+            return {"status": "error", "items": [], "paths": [], "media_ids": [], "added": 0, "already_present": 0, "failed": len(inputs), "error": "At most 50 media files can be added at once."}
+        trimmed_galleries = set()
+        items = [self._add_to_gallery_item(value, trimmed_galleries) for value in inputs]
+        successful = [item for item in items if item["status"] == "done"]
+        if successful:
+            from shared.gradio.gallery_files import expose_gallery_files
+
+            expose_gallery_files([item["path"] for item in successful])
+        for item in successful:
+            self.send_cmd("refresh_gallery", {"path": item["path"]})
+        failed = len(items) - len(successful)
+        result = {
+            "status": "error" if not successful else "partial" if failed else "done",
+            "items": items,
+            "paths": [item["path"] for item in successful],
+            "media_ids": [item["media_id"] for item in successful],
+            "added": sum(not item["already_present"] for item in successful),
+            "already_present": sum(item["already_present"] for item in successful),
+            "failed": failed,
+            "error": "; ".join(item["error"] for item in items if item["error"]),
+        }
+        if len(items) == 1:
+            result.update({key: items[0][key] for key in ("media_id", "media_type", "already_present")})
+        return result
+
+    def _add_to_gallery_item(self, path: str, trimmed_galleries: set[bool]) -> dict[str, Any]:
+        source = self._resolve_media_record_input(path)
+        if source is None:
+            return {"status": "error", "path": str(path or "").strip(), "media_id": "", "media_type": "", "already_present": False, "error": "Not an authorized existing image, video, or audio file."}
+        output_path = os.path.abspath(os.path.normpath(str(source.get("path", "") or "")))
+        media_type = str(source.get("media_type", "") or "").strip()
+        try:
+            if media_type == "image":
+                with Image.open(output_path) as image:
+                    image.verify()
+            elif media_type == "video":
+                get_video_info(output_path)
+            elif media_type == "audio":
+                from shared.utils.audio_video import get_audio_file_sample_rate
+
+                get_audio_file_sample_rate(output_path)
+            else:
+                raise ValueError(f"Unsupported media file: {os.path.basename(output_path)}")
+        except Exception as exc:
+            return {"status": "error", "path": output_path, "media_id": str(source.get("media_id", "") or ""), "media_type": media_type, "already_present": False, "error": str(exc) or "Unable to read media file."}
+        settings = dict(source.get("settings", {}) or {}) or self._read_media_settings(output_path, media_type)
+        audio_only = media_type == "audio"
+        path_key, settings_key, selection_key = ("audio_file_list", "audio_file_settings_list", "audio_selected") if audio_only else ("file_list", "file_settings_list", "selected")
+        gallery_paths = self.gen.setdefault(path_key, [])
+        existing_index = next((index for index, gallery_path in enumerate(gallery_paths) if os.path.normcase(os.path.abspath(str(gallery_path))) == os.path.normcase(output_path)), None)
+        already_present = existing_index is not None
+        if existing_index is None:
+            if not callable(self.record_file_metadata):
+                return {"status": "error", "path": output_path, "media_id": "", "media_type": media_type, "already_present": False, "error": "WanGP Gallery recording is unavailable."}
+            if audio_only not in trimmed_galleries:
+                self._trim_gallery_history(audio_only)
+                trimmed_galleries.add(audio_only)
+            self.record_file_metadata(output_path, settings, media_type == "image", audio_only, self.gen, notify_generation=False, write_metadata=False, record_notification=False)
+            existing_index = next(index for index, gallery_path in enumerate(self.gen[path_key]) if os.path.normcase(os.path.abspath(str(gallery_path))) == os.path.normcase(output_path))
+        else:
+            saved_settings = self.gen.setdefault(settings_key, [])
+            if settings and existing_index < len(saved_settings) and not saved_settings[existing_index]:
+                saved_settings[existing_index] = settings
+        record = self._register_tool_media(output_path, settings, label=f"Imported {media_type}")
+        self.gen[selection_key] = existing_index
+        self.gen["audio_last_selected" if audio_only else "last_selected"] = existing_index + 1 >= len(self.gen[path_key])
+        self.gen["last_was_audio"] = audio_only
+        self.gen["current_gallery_source"] = "audio" if audio_only else "video"
+        self.gen["selected_video_time"] = 0.0 if media_type == "video" else None
+        return {"status": "done", "path": output_path, "media_id": "" if record is None else record.get("media_id", ""), "media_type": media_type, "already_present": already_present, "error": ""}
+
+    @assistant_tool(
         display_name="Create Color Frame",
         description="Create a solid-color image with the requested width and height, rounded to the nearest multiple of 16, and add it to WanGP galleries. Use this for blank frames, color cards, or transition plates.",
         parameters={
@@ -3439,6 +3553,62 @@ class DeepyZeroTools:
         }
         self._update_tool_progress("done", "Done", result)
         self._set_status("Color frame created.", kind="tool")
+        return result
+
+    @assistant_tool(
+        display_name="Side by Side",
+        description="Place any number of images or videos in one comparison image or video.",
+        parameters={
+            "media_ids": {"type": "array", "items": {"type": "string"}, "description": "Ordered image or video media ids."},
+            "layout": {"type": "string", "description": "Optional: horizontal (default), vertical, grid, or COLSxROWS.", "required": False},
+            "legends": {"type": "array", "items": {"type": "string"}, "description": "Optional labels in media order.", "required": False},
+        },
+        pause_runtime=False,
+    )
+    def side_by_side(self, media_ids: list[str], layout: str | None = None, legends: list[str] | None = None) -> dict[str, Any]:
+        self._sync_recent_media()
+        if not isinstance(media_ids, list) or not media_ids:
+            return {"status": "error", "media_ids": media_ids, "output_file": "", "error": "media_ids must be a non-empty array."}
+        media = []
+        for index, media_id in enumerate(media_ids):
+            record = self._resolve_media_record_input(media_id)
+            if record is None:
+                return {"status": "error", "media_ids": media_ids, "output_file": "", "error": f"Unknown media id at index {index}."}
+            if record.get("media_type") not in {"image", "video"}:
+                return {"status": "error", "media_ids": media_ids, "output_file": "", "error": f"media_ids[{index}] must reference an image or video."}
+            media.append(record)
+        is_video = any(record["media_type"] == "video" for record in media)
+        resolved_layout = str(layout or "horizontal").strip().lower() or "horizontal"
+        video_codec, video_container = self._get_video_output_settings()
+        extension = deepy_video_tools.get_video_container_extension(video_container) if is_video else ".png"
+        output_path = self._resolve_direct_output_path(f"side_by_side{extension}", not is_video, False)
+        self._set_status("Building side-by-side media...", kind="tool")
+        self._update_tool_progress("running", "Composing", {"status": "running", "media_ids": [record["media_id"] for record in media], "layout": resolved_layout})
+        try:
+            output_path = deepy_video_tools.side_by_side_media([record["path"] for record in media], output_path, resolved_layout, legends, video_codec=video_codec, video_container=video_container, audio_codec=self._get_video_audio_output_codec())
+        except Exception as exc:
+            result = {"status": "error", "media_ids": [record["media_id"] for record in media], "layout": resolved_layout, "output_file": "", "error": str(exc)}
+            self._update_tool_progress("error", "Error", result)
+            self._set_status(f"Side-by-side composition failed: {exc}", kind="error")
+            return result
+        if is_video:
+            settings = self._build_deepy_settings(f"A side-by-side comparison video of {len(media)} media items.", f"Composed {len(media)} media items in a {resolved_layout} layout", image_mode=0)
+            self._update_video_metadata_fields(output_path, settings)
+        else:
+            with Image.open(output_path) as image:
+                width, height = image.size
+            settings = self._build_direct_image_settings(f"Composed {len(media)} images in a {resolved_layout} layout", width, height, prompt=f"A side-by-side comparison of {len(media)} images.")
+        media_record = self._record_direct_media(output_path, settings, is_image=not is_video, audio_only=False, label=f"Side-by-side {'video' if is_video else 'image'}")
+        result = {
+            "status": "done",
+            "media_id": "" if media_record is None else media_record.get("media_id", ""),
+            "source_media_ids": [record["media_id"] for record in media],
+            "layout": resolved_layout,
+            "output_file": output_path,
+            "error": "",
+        }
+        self._update_tool_progress("done", "Done", result)
+        self._set_status("Side-by-side media created.", kind="tool")
         return result
 
     @assistant_tool(
@@ -4229,6 +4399,21 @@ class DeepyZeroTools:
         return result
 
     @assistant_tool(
+        name="notify",
+        display_name="Send Notification",
+        description="Send a message through WanGP's configured notification destinations.",
+        parameters={"message": {"type": "string", "description": "Message."}, "title": {"type": "string", "description": "Optional title.", "required": False}},
+        pause_runtime=False,
+    )
+    def notify(self, message: str, title: str = "Deepy notification") -> dict[str, Any]:
+        from shared.notifications import send_notification
+
+        message = str(message or "").strip()
+        if not message:
+            return {"status": "error", "sent": False, "error": "message is required"}
+        return send_notification(self._server_config(), str(title or "Deepy notification").strip(), message)
+
+    @assistant_tool(
         display_name="List Files",
         description="List files directly inside a filesystem directory, optionally filtering by file extensions. Returns filenames, extensions, full paths, and byte sizes.",
         parameters={
@@ -4239,7 +4424,7 @@ class DeepyZeroTools:
         requires_file_system=True,
     )
     def list_files(self, path: str, extensions: list[str] | None = None) -> dict[str, Any]:
-        return deepy_filesystem.list_files(path, extensions)
+        return deepy_filesystem.list_files(path, extensions, self._file_access_policy())
 
     @assistant_tool(
         display_name="Query File",
@@ -4250,7 +4435,8 @@ class DeepyZeroTools:
     )
     def query_file(self, path: str) -> dict[str, Any]:
         media_record = self._resolve_media_record_input(path)
-        return deepy_filesystem.query_file(media_record["path"] if media_record is not None else path)
+        resolved = media_record["path"] if media_record is not None else str(self._file_access_policy().require_read(path, file=True))
+        return deepy_filesystem.query_file(resolved)
 
     @assistant_tool(
         display_name="Search Doc",
@@ -4626,11 +4812,12 @@ class DeepyZeroTools:
                 "description": "Optional frame number to inspect for every video supplied through media_id or media_ids. If omitted, frame 0 is used. Do not use it with media_inputs.",
                 "required": False,
             },
+            "bbox": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 1000}, "minItems": 4, "maxItems": 4, "description": "Optional normalized [x_min,y_min,x_max,y_max] crop, applied before resize.", "required": False},
         },
         pause_runtime=False,
         pause_reason="vision",
     )
-    def inspect_media(self, media_id: str | None = None, question: str = "", frame_no: int | None = None, media_ids: list[str] | None = None, media_inputs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def inspect_media(self, media_id: str | None = None, question: str = "", frame_no: int | None = None, media_ids: list[str] | None = None, media_inputs: list[dict[str, Any]] | None = None, bbox: list[int] | None = None) -> dict[str, Any]:
         self._sync_recent_media()
         single_media_id = str(media_id or "").strip()
         question = str(question or "").strip()
@@ -4647,6 +4834,10 @@ class DeepyZeroTools:
             frame_no = None if frame_no is None or str(frame_no).strip() == "" else int(frame_no)
         except Exception:
             return {"status": "error", "media_id": single_media_id, "media_ids": list(media_ids or []), "media_inputs": list(media_inputs or []), "question": question, "answer": "", "error": "frame_no must be an integer."}
+        try:
+            bbox = deepy_vision.normalize_inspection_bbox(bbox)
+        except ValueError as exc:
+            return {"status": "error", "media_id": single_media_id, "media_ids": list(media_ids or []), "media_inputs": list(media_inputs or []), "question": question, "answer": "", "error": str(exc)}
         if media_inputs is not None and frame_no is not None:
             return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": media_inputs, "question": question, "answer": "", "error": "Do not combine frame_no with media_inputs; put frame_no inside each video input."}
         raw_inputs = list(media_inputs or []) if media_inputs is not None else [{"media_id": value, "frame_no": frame_no} for value in ([single_media_id] if single_media_id else list(media_ids or []))]
@@ -4681,7 +4872,7 @@ class DeepyZeroTools:
             requested_inputs.append({"media_id": requested_media_id.strip(), "frame_no": input_frame_no, "time_seconds": input_time_seconds})
         requested_media_ids = [item["media_id"] for item in requested_inputs]
         progress_inputs = [{key: value for key, value in item.items() if value is not None} for item in requested_inputs]
-        self._update_tool_progress("running", "Inspecting", {"status": "running", "media_id": single_media_id, "media_ids": requested_media_ids, "media_inputs": progress_inputs, "question": question, "frame_no": frame_no})
+        self._update_tool_progress("running", "Inspecting", {"status": "running", "media_id": single_media_id, "media_ids": requested_media_ids, "media_inputs": progress_inputs, "question": question, "frame_no": frame_no, "bbox": bbox})
         if self.session is None:
             return {"status": "error", "media_id": single_media_id, "media_ids": requested_media_ids, "media_inputs": progress_inputs, "question": question, "answer": "", "error": "Assistant session is not available."}
         media_records = []
@@ -4697,6 +4888,7 @@ class DeepyZeroTools:
             inspection_record = dict(media_record)
             inspection_record["frame_no"] = (requested_input["frame_no"] if requested_input["frame_no"] is not None or requested_input["time_seconds"] is not None else 0) if media_record.get("media_type") == "video" else None
             inspection_record["time_seconds"] = requested_input["time_seconds"] if media_record.get("media_type") == "video" else None
+            inspection_record["bbox"] = bbox
             media_records.append(inspection_record)
         if self._vision_query_callback is None:
             return {
@@ -5838,7 +6030,19 @@ class AssistantEngine:
         if self._active_tool_context is None:
             return
         message_id, tool_id = self._active_tool_context
-        self._emit_chat_event(assistant_chat.update_tool_call(self.session, message_id, tool_id, status=status, status_text=status_text, result=result))
+        self._emit_chat_event(assistant_chat.update_tool_call(self.session, message_id, tool_id, status=status, status_text=status_text, result=self._virtualize_tool_result(result)))
+
+    def _virtualize_tool_result(self, result: dict[str, Any] | None) -> dict[str, Any] | None:
+        if result is None:
+            return None
+        policy = getattr(self.tool_box, "file_access_policy", None)
+        if policy is None:
+            policy_getter = getattr(self.tool_box, "_file_access_policy", None)
+            policy = policy_getter() if callable(policy_getter) else None
+        if policy is None:
+            return result
+        self.session.file_access_policy = policy
+        return policy.virtualize_result(result)
 
     def _acquire_runtime(self) -> Qwen35AssistantRuntime:
         acquired_here = False
@@ -5881,35 +6085,38 @@ class AssistantEngine:
         media_records = list(media_record) if isinstance(media_record, list) else [media_record]
         images = [None] * len(media_records)
         inspected_media = []
-        video_inputs: dict[str, list[tuple[int, int]]] = {}
+        video_inputs: dict[str, list[tuple[int, int, list[int] | None]]] = {}
         for input_index, current_record in enumerate(media_records):
             media_path = str(current_record.get("path", "")).strip()
             if len(media_path) == 0 or not os.path.isfile(media_path):
                 raise FileNotFoundError(f"Media file not found: {media_path}")
             media_type = str(current_record.get("media_type", "")).strip().lower()
+            bbox = current_record.get("bbox", None)
             resolved_frame_no = None
             time_seconds = current_record.get("time_seconds", None)
             if media_type == "video":
                 requested_frame_no = current_record.get("frame_no", frame_no)
                 resolved_frame_no = deepy_video_tools.resolve_video_frame_no(media_path, frame_no=requested_frame_no, time_seconds=time_seconds) if requested_frame_no is not None or time_seconds is not None else 0
-                video_inputs.setdefault(media_path, []).append((input_index, resolved_frame_no))
+                video_inputs.setdefault(media_path, []).append((input_index, resolved_frame_no, bbox))
             else:
                 with Image.open(media_path) as image_handle:
-                    image = image_handle.convert("RGB")
-                    images[input_index] = deepy_vision.resize_inspection_image(image, max_image_edge) if max_image_edge is not None else image
-            inspected_media.append({"input_index": input_index + 1, "media_id": current_record.get("media_id", ""), "media_type": media_type, "label": current_record.get("label", ""), "frame_no": resolved_frame_no, "time_seconds": time_seconds})
+                    images[input_index] = deepy_vision.prepare_inspection_image(image_handle, max_edge=max_image_edge, bbox=bbox)
+            inspected_media.append({"input_index": input_index + 1, "media_id": current_record.get("media_id", ""), "media_type": media_type, "label": current_record.get("label", ""), "frame_no": resolved_frame_no, "time_seconds": time_seconds, "bbox": bbox})
         for media_path, indexed_frames in video_inputs.items():
-            decoded_images = deepy_vision.decode_inspection_video_frames(media_path, [item[1] for item in indexed_frames], max_edge=max_image_edge)
-            for (input_index, _resolved_frame_no), decoded_image in zip(indexed_frames, decoded_images):
+            bboxes = [item[2] for item in indexed_frames]
+            decode_kwargs = {"max_edge": max_image_edge, **({"bboxes": bboxes} if any(bbox is not None for bbox in bboxes) else {})}
+            decoded_images = deepy_vision.decode_inspection_video_frames(media_path, [item[1] for item in indexed_frames], **decode_kwargs)
+            for (input_index, _resolved_frame_no, _bbox), decoded_image in zip(indexed_frames, decoded_images):
                 images[input_index] = decoded_image
         visual_labels = []
         for index, item in enumerate(inspected_media):
             source_label = str(item.get("label", "") or os.path.basename(str(media_records[index].get("path", "")))).strip()
+            bbox_label = "" if item["bbox"] is None else f", bbox {item['bbox']}"
             if item["media_type"] == "video":
                 time_label = "" if item["time_seconds"] is None else f" at {float(item['time_seconds']):.3f} seconds"
-                visual_labels.append(f"Visual {index + 1}: video {source_label}, frame {item['frame_no']}{time_label}.")
+                visual_labels.append(f"Visual {index + 1}: video {source_label}, frame {item['frame_no']}{time_label}{bbox_label}.")
             else:
-                visual_labels.append(f"Visual {index + 1}: image {source_label}.")
+                visual_labels.append(f"Visual {index + 1}: image {source_label}{bbox_label}.")
         caption_model, caption_processor = self._ensure_vision_loaded()
         prompt_token_ids, prompt_embeds, prompt_position_ids, position_offset = deepy_vision.build_image_question_prompt(
             caption_model,
@@ -7052,7 +7259,7 @@ class AssistantEngine:
         self._emit_chat_event(tool_event)
         validation_error = self.tool_box.validate_tool_call(tool_name, arguments)
         if len(validation_error) > 0:
-            result = self._build_tool_error(tool_name, arguments, validation_error)
+            result = self._virtualize_tool_result(self._build_tool_error(tool_name, arguments, validation_error))
             self._log(f"Tool validation error: {validation_error}")
             self._set_status(f"{tool_label} failed: {validation_error}", kind="error")
             self._emit_chat_event(assistant_chat.complete_tool_call(self.session, message_id, tool_id, result))
@@ -7077,6 +7284,7 @@ class AssistantEngine:
             steering_after_action = finish_assistant_action(self.session)
         if steering_after_action:
             self._set_status("Steering accepted. Applying the new instructions at the action boundary...", kind="queued")
+        result = self._virtualize_tool_result(result)
         self._log(f"Tool result: {_json_dumps(result)}")
         self._emit_chat_event(assistant_chat.complete_tool_call(self.session, message_id, tool_id, result))
         # Queue-backed tools can finish and immediately trigger another model pass; emit a full
@@ -7710,7 +7918,8 @@ class AssistantEngine:
                 raw_text = segment_raw_text
                 if len(self._continued_segment_raw_text) > 0:
                     raw_text = self._merge_text_continuation(self._continued_segment_raw_text, raw_text)
-                tool_calls = extract_tool_calls(raw_text)
+                tool_parameters = {str(function.get("name", "")): set(function.get("parameters", {}).get("properties", {})) for schema in self.tool_box.get_tool_schemas() for function in [schema.get("function", {})]}
+                tool_calls = extract_tool_calls(raw_text, tool_parameters=tool_parameters)
                 if len(tool_calls) == 0:
                     tool_calls = self.tool_box.infer_tool_calls(raw_text)
                 deduplicated_tool_calls = self._deduplicate_tool_calls(tool_calls)
@@ -7851,6 +8060,8 @@ class AssistantEngine:
             self._emit_stats(force=True)
         if not self.session.interrupt_requested and len(final_user_text.strip()) > 0:
             self._send_chat(final_user_text)
+        if turn_completed and not self.session.interrupt_requested:
+            self._emit_chat_event(assistant_chat.linkify_message_download_references(self.session, self._active_turn_id, getattr(self.tool_box, "file_access_policy", None)))
         if turn_completed and not self.session.interrupt_requested and len(self.session.interruption_notice.strip()) > 0:
             if self.debug_enabled:
                 self._log("Clearing interruption notice after a successful follow-up turn.")
