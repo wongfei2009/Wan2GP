@@ -1576,6 +1576,33 @@ class WanGPSession:
             return path.resolve()
         return (caller_base_path / path).resolve()
 
+    # Media settings that carry a caller-supplied path but are NOT in wgp.py's
+    # ATTACHMENT_KEYS, so nothing else resolves them. The H3 Face Refiner's
+    # reference images go through clean_image_list -> _open_image_input, which
+    # opens the path from the SERVER's cwd -- so an upload named the way every
+    # attachment is named ("<name>", relative to the outputs dir since 12.643)
+    # raises FileNotFoundError. Resolve them against the served outputs root.
+    _OUTPUTS_RELATIVE_MEDIA_KEYS = ("spatial_upsampler_reference_images",)
+
+    def _served_output_root(self) -> str:
+        runtime = self._ensure_runtime()
+        with _pushd(runtime.root):
+            output_dir = self._output_dir if self._output_dir is not None else getattr(runtime.module, "image_save_path", None) or "outputs"
+            return os.path.realpath(str(output_dir))
+
+    def _absolutize_outputs_relative(self, value: Any, output_root: str) -> Any:
+        if isinstance(value, list):
+            return [self._absolutize_outputs_relative(item, output_root) for item in value]
+        if isinstance(value, os.PathLike):
+            value = os.fspath(value)
+        if not isinstance(value, str) or not value.strip() or os.path.isabs(value):
+            return value
+        # Leave anything we cannot place alone rather than rewriting it: a caller
+        # may legitimately be naming a path the server resolves some other way,
+        # and a wrong absolute path is harder to diagnose than the original.
+        candidate = os.path.realpath(os.path.join(output_root, value))
+        return candidate if os.path.isfile(candidate) else value
+
     def _absolutize_task_paths(self, task: dict[str, Any], caller_base_path: Path) -> dict[str, Any]:
         normalized = copy.deepcopy(task)
         settings = normalized.get("params")
@@ -1585,6 +1612,12 @@ class WanGPSession:
             if key not in settings:
                 continue
             settings[key] = self._absolutize_setting_path(settings[key], caller_base_path)
+        if any(key in settings for key in self._OUTPUTS_RELATIVE_MEDIA_KEYS):
+            output_root = self._served_output_root()
+            for key in self._OUTPUTS_RELATIVE_MEDIA_KEYS:
+                if key not in settings:
+                    continue
+                settings[key] = self._absolutize_outputs_relative(settings[key], output_root)
         return normalized
 
     def _get_attachment_keys(self) -> tuple[str, ...]:
