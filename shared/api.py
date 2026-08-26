@@ -943,6 +943,54 @@ class WanGPSession:
             "height": mask_image.height,
         }
 
+    def generate_video_mask(self, video: str, keywords: str, *, negative: bool = False, fill_holes: bool = True, max_seconds: float | None = None) -> dict[str, Any]:
+        from shared import magic_mask
+        from shared.utils.download import process_files_def
+        from shared.utils.process_locks import acquire_GPU_ressources, release_GPU_ressources
+
+        parsed_keywords = magic_mask.parse_keywords(keywords)
+        if len(parsed_keywords) == 0:
+            raise ValueError("keywords must contain at least one keyword")
+        # Fail fast rather than block: acquire_GPU_ressources would wait out a whole
+        # video job and the MCP request would just hang.
+        with self._job_lock:
+            if self._active_job is not None and not self._active_job.done:
+                raise RuntimeError("WanGP session already has a generation in progress")
+        runtime = self._ensure_runtime()
+        with _pushd(runtime.root):
+            output_dir = self._output_dir if self._output_dir is not None else getattr(runtime.module, "image_save_path", None) or "outputs"
+            output_root = os.path.realpath(str(output_dir))
+            # The MCP server has no auth; never let this become an arbitrary-file reader.
+            source_path = os.path.realpath(str(video))
+            if not os.path.normcase(source_path).startswith(os.path.normcase(output_root + os.sep)):
+                raise ValueError(f"'{video}' is outside the outputs directory")
+            if not os.path.isfile(source_path):
+                raise ValueError(f"Video not found: {video}")
+            process_files_def(**magic_mask.query_download_def())
+            acquire_GPU_ressources(self._state, magic_mask.PROCESS_ID, magic_mask.PROCESS_NAME)
+            try:
+                # magic_mask.generate_video_mask defaults output_dir to "mask_outputs",
+                # which the file server (rooted at the outputs dir) does not serve.
+                # Passing output_root is the whole routing change: everything else --
+                # SAM3 per frame, the binary hard edge, the MP4 writer -- is unchanged.
+                # Deliberately not exposing colorize/background: --video-mask consumes
+                # a binary black-and-white mask and nothing else.
+                mask_path, used_keywords = magic_mask.generate_video_mask(
+                    source_path,
+                    keywords,
+                    no_hole=bool(fill_holes),
+                    negative_mask=bool(negative),
+                    max_time_seconds=max_seconds,
+                    output_dir=output_root,
+                )
+            finally:
+                release_GPU_ressources(self._state, magic_mask.PROCESS_ID)
+        return {
+            "mask": str(Path(mask_path).resolve()),
+            "keywords": used_keywords,
+            "negative": bool(negative),
+        }
+
     def _run_matanyone(self, frames, seed, *, version: str, erode: int, dilate: int, warmup: int):
         import numpy as np
         import torch

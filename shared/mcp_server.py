@@ -1413,6 +1413,12 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         return session.generate_mask(image, keywords, negative=negative, fill_holes=fill_holes)
 
     @mcp.tool()
+    def wangp_generate_video_mask(video: str, keywords: str, negative: bool = False, fill_holes: bool = True, max_seconds: float | None = None) -> dict[str, Any]:
+        """Generate a black-and-white inpaint mask VIDEO for a clip from text keywords, using SAM3 (Magic Mask) on every frame. video is a path relative to the outputs directory (upload it first); keywords are comma- or newline-separated ('head, hair'). White = the matched objects, i.e. the region --video-mask regenerates. SAM3 re-detects per frame, so it picks up a subject entering later, and the edge is HARD -- for soft alpha to composite locally, use generate_matte instead (never feed a matte to --video-mask: wgp.py thresholds it and discards the gradient). negative inverts; fill_holes closes small holes; max_seconds caps a long clip (it decodes wholly into RAM). Returns the saved mask video's absolute path. Model weights download on first use."""
+
+        return session.generate_video_mask(video, keywords, negative=negative, fill_holes=fill_holes, max_seconds=max_seconds)
+
+    @mcp.tool()
     def wangp_generate_matte(video: str, keywords: str = "", seed_mask: str | None = None, matanyone_version: str = "v1", erode: int = 0, dilate: int = 0, warmup: int = 10, max_seconds: float | None = None, fill_holes: bool = True) -> dict[str, Any]:
         """Generate a soft alpha matte video for a clip, using MatAnyone. video (and seed_mask) are paths relative to the outputs directory (upload first). Seed with exactly one of: keywords (SAM3 segments frame 0) or seed_mask (a black-and-white PNG). MatAnyone then propagates that seed forward with continuous alpha -- soft edges on hair and motion blur, temporally stable, but it never picks up a subject entering later; use generate_mask for per-frame re-detection. matanyone_version is 'v1' (default, generally preferred) or 'v2'. erode/dilate adjust the seed; warmup primes memory on frame 0. max_seconds caps a long clip. Returns the saved matte's absolute path. Weights download on first use."""
 
