@@ -8,7 +8,8 @@ import torch
 from shared.utils.hf import build_hf_url
 from shared.utils.frame_scheduler import normalize_overlap
 
-from .constants import H3_PHASE_2_NOISE_LEVEL_START_DEFAULT
+from .constants import (H3_MASK_MODE_DEFAULT, H3_MASK_MODE_GROUPED_ROWS, H3_MASK_MODE_SHARED_TIMESTEP,
+                        H3_MASK_MODE_SETTING, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, h3_grouped_masking_enabled)
 from .minimax_h3_main import AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER, VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE
 from .prompt_enhancer import (FL2VA_IMAGE_SYSTEM_PROMPT, FL2VA_PROMPT_INFOS, FL2VA_TEXT_SYSTEM_PROMPT,
                               REF2VA_IMAGE_SYSTEM_PROMPT, REF2VA_PROMPT_INFOS, REF2VA_TEXT_SYSTEM_PROMPT)
@@ -147,6 +148,20 @@ PRUNED_INFOS = """
 The Pruned checkpoint replaces the full AdaLN timestep projection matrices with precomputed low-rank modulation curves. It accepts the same inputs and settings as its 33B counterpart while reducing checkpoint size and weight-transfer cost.
 """
 
+H3_FINETUNES_INFOS = """### H3 finetune QKV layout
+
+Most H3 checkpoints use the official **Interleaved** QKV layout. Select **Grouped** only when the checkpoint stores all Q rows, then K rows, then V rows. INT8 ConvRot uses its own layout metadata.
+"""
+
+H3_FINETUNES_PARAMS = {
+    "qkv_layout": {
+        "label": "QKV Layout",
+        "choices": [("Interleaved (official H3)", "interleaved"), ("Grouped Q / K / V", "grouped")],
+        "default": "interleaved",
+        "description": "Physical row order of fused QKV tensors in the finetune checkpoint. This does not enable or disable QKV splitting.",
+    },
+}
+
 
 class family_handler:
     @staticmethod
@@ -210,6 +225,18 @@ class family_handler:
             "visible_phases": 0,
             "lora_multiplier_phases": 2,
             "phase_2_spatial_tiling": True,
+            "custom_settings": [{
+                "id": H3_MASK_MODE_SETTING,
+                "name": "Mask Denoising Mode",
+                "label": "Mask Denoising Mode",
+                "type": "dropdown",
+                "default": H3_MASK_MODE_DEFAULT,
+                "choices": [
+                    ("Grouped Rows [conditioning timestep for fixed rows; denoising timestep for editable rows]", H3_MASK_MODE_GROUPED_ROWS),
+                    ("Shared Timestep [same denoising timestep for fixed and editable latent rows]", H3_MASK_MODE_SHARED_TIMESTEP),
+                ],
+                "video_prompt_type": "G",
+            }],
             "switch_threshold": {
                 "label": "Phase 2 Noise Level Start",
                 "type": "number",
@@ -254,9 +281,12 @@ class family_handler:
             "video_prompt_enhancer_max_tokens": 2048 if reference_mode else 1024,
             "profiles_dir": ["minimax_h3"],
             "finetune_custom_urls": ["video_vae_file", "audio_vae_file"],
+            "finetunes_infos": H3_FINETUNES_INFOS,
+            "finetunes_params": H3_FINETUNES_PARAMS,
             TURBO_LORA_KEY: build_hf_url(REPO_ID, "loras", TURBO_LORA_FILE),
             REF_TURBO_LORA_KEY: build_hf_url(REPO_ID, "loras", REF_TURBO_LORA_FILE),
             "qkv_splitting": True,
+            "qkv_layout": "interleaved",
             "keep_frames_video_guide_not_supported": True,
             "text_encoder_folder": TEXT_ENCODER_FOLDER,
             "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, filename) for filename in text_encoder_files],
@@ -302,17 +332,18 @@ class family_handler:
                 "any_image_refs_relative_size": True,
                 "image_refs_relative_size": {"min": 50, "max": 400, "step": 1},
                 "guide_custom_choices": {
-                    "choices": [("Generate without a Reference or Control Video", ""), ("Use One Reference Video", "V-"),
-                                ("Use Two Reference Videos", "V+-"),
+                    "choices": [("Generate without a Reference or Control Video", ""), ("Use One Reference Video", "V-U"),
+                                ("Use Two Reference Videos", "V+-U"),
                                 # ("Transfer Human Pose From Control Video", "PV"),
                                 ("Transfer Depth Map From Control Video", "DV"),
                                 # ("Transfer Edges Map From Control Video", "EV"),
-                                ("Provide Generic Control Video", "V")],
-                    "letters_filter": "PDEV+-",
+                                ("Provide Generic Control Video", "GV")],
+                    "letters_filter": "UGPDEV+-",
                     "default": "",
                     "label": "Reference / Control Video",
                 },
                 "preprocess_video_guide2": True,
+                "mask_preprocessing": {"selection": ["", "A", "NA"]},
                 "reference_video_max_frames": 15 * 24,
                 "reference_video_max_size": (768, 1344),
                 "any_audio_prompt": True,
@@ -356,6 +387,9 @@ class family_handler:
                 },
                 "video_guide_label": "Control Video",
                 "mask_preprocessing": {"selection": ["", "A", "NA"]},
+                # "video_guide_outpainting": [0],
+                # "video_guide_outpainting_label": "Enable Spatial Outpainting on the H3 Control Video",
+                "outpainting_quantize_margins": 32,
                 "custom_frames_injection": True,
                 "one_image_ref_only": True,
                 "no_background_removal": True,
@@ -386,6 +420,13 @@ class family_handler:
         if error:
             return error
         inputs["sliding_window_overlap"] = overlap
+        if h3_grouped_masking_enabled(inputs.get("custom_settings")) and inputs.get("override_attention") == "sol":
+            from shared.utils.utils import get_outpainting_dims
+
+            outpainting = get_outpainting_dims(inputs.get("video_guide_outpainting"), inputs.get("video_guide_outpainting_ratio", "")) is not None
+            masked_control = inputs.get("video_mask") is not None or outpainting or "A" in (inputs.get("video_prompt_type") or "")
+            if masked_control:
+                return "MiniMax H3 Grouped Rows mask denoising is not compatible with Sol Attention; select Shared Timestep or another attention mode"
         if "~" in (inputs["video_prompt_type"] or ""):
             from .pipeline import H3_PHASE_2_TILE_COUNT, _spatial_tiles
 
@@ -420,9 +461,11 @@ class family_handler:
         video_prompt_type = inputs["video_prompt_type"]
         audio_prompt_type = inputs["audio_prompt_type"]
         image_count = len(inputs["image_refs"] or [])
-        videos = [inputs["video_guide"]] if "V" in video_prompt_type else []
-        if "+" in video_prompt_type:
-            videos.append(inputs["video_guide2"])
+        videos = []
+        if "V" in video_prompt_type and "G" not in video_prompt_type:
+            videos.append(inputs["video_guide"])
+            if "+" in video_prompt_type:
+                videos.append(inputs["video_guide2"])
         audios = [inputs["audio_guide"]] if "A" in audio_prompt_type else []
         if "B" in audio_prompt_type:
             audios.append(inputs["audio_guide2"])
@@ -522,6 +565,7 @@ class family_handler:
                                  reference_mode=base_model_type in (REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE),
                                  save_quantized=save_quantized, model_type=model_type,
                                  qkv_splitting=model_def["qkv_splitting"],
+                                 qkv_layout=model_def["qkv_layout"],
                                  video_vae_filename=model_def.get("video_vae_file", VIDEO_VAE_FILE),
                                  audio_vae_filename=model_def.get("audio_vae_file", AUDIO_VAE_FILE), shared_h3_pipeline=shared_h3_pipeline)
         pipe = {"transformer": pipeline.transformer}
@@ -570,6 +614,13 @@ class family_handler:
             ui_defaults["video_prompt_type"] = ui_defaults.get("video_prompt_type", "").replace("G", "")
         if settings_version < 2.68 and "V" in ui_defaults.get("video_prompt_type", "") and "-" not in ui_defaults["video_prompt_type"]:
             ui_defaults["video_prompt_type"] += "-"
+        if settings_version < 2.76:
+            video_prompt_type = ui_defaults.get("video_prompt_type", "")
+            if "V" in video_prompt_type and not any(flag in video_prompt_type for flag in "PDEG+-"):
+                video_prompt_type = video_prompt_type.replace("V", "GV", 1)
+            elif "V" in video_prompt_type and any(flag in video_prompt_type for flag in "+-") and "U" not in video_prompt_type:
+                video_prompt_type += "U"
+            ui_defaults["video_prompt_type"] = video_prompt_type
 
     @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):
