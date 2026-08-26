@@ -561,6 +561,45 @@ class SessionJob:
         return self._webui_owner_call_id
 
 
+def _resolve_in_outputs(path: str, output_root: str, label: str) -> str:
+    """Resolve a caller-supplied media path against the served outputs directory.
+
+    Callers name an upload the way every other attachment does. That spelling
+    CHANGED: WanGP 12.643 began resolving a relative ATTACHMENT_KEY path against
+    the outputs dir rather than the WanGP root, so clients that used to send
+    "outputs/<name>" now send a bare "<name>". Resolving from cwd only -- which
+    is what these tools did -- rejects the bare form outright.
+
+    So try output_root first, then fall back to cwd (which still accepts the
+    legacy "outputs/<name>"), and only then enforce containment. The MCP server
+    has no auth, so the containment check is what stops this becoming an
+    arbitrary-file reader; normcase so it holds on Windows, where the two paths
+    can reach realpath with different casing.
+    """
+    # realpath the root too: on macOS /var is a symlink to /private/var, so a root
+    # the caller resolved differently from the source would fail containment for
+    # every path. Cheap, and it makes the check independent of the caller.
+    output_root = os.path.realpath(str(output_root))
+    raw = str(path)
+    candidates = []
+    if os.path.isabs(raw):
+        candidates.append(raw)
+    else:
+        candidates.append(os.path.join(output_root, raw))
+        candidates.append(raw)
+    resolved = ""
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if os.path.isfile(real):
+            resolved = real
+            break
+    if not resolved:
+        raise ValueError(f"{label} not found: {path}")
+    if not os.path.normcase(resolved).startswith(os.path.normcase(output_root + os.sep)):
+        raise ValueError(f"'{path}' is outside the outputs directory")
+    return resolved
+
+
 class WanGPSession:
     def __init__(
         self,
@@ -905,17 +944,7 @@ class WanGPSession:
             # directory the file server serves.
             output_dir = self._output_dir if self._output_dir is not None else getattr(runtime.module, "image_save_path", None) or "outputs"
             output_root = os.path.realpath(str(output_dir))
-            # Callers name uploads the way every other attachment does — relative to
-            # the WanGP root, e.g. "outputs/<name>" — so resolve from cwd, not from
-            # output_root, or the outputs segment gets doubled.
-            source_path = os.path.realpath(str(image))
-            # The MCP server has no auth; never let this become an arbitrary-file reader.
-            # normcase so the check holds on Windows, where the two paths can reach
-            # realpath with different casing.
-            if not os.path.normcase(source_path).startswith(os.path.normcase(output_root + os.sep)):
-                raise ValueError(f"'{image}' is outside the outputs directory")
-            if not os.path.isfile(source_path):
-                raise ValueError(f"Image not found: {image}")
+            source_path = _resolve_in_outputs(image, output_root, "Image")
             process_files_def(**magic_mask.query_download_def())
             acquire_GPU_ressources(self._state, magic_mask.PROCESS_ID, magic_mask.PROCESS_NAME)
             try:
@@ -960,12 +989,7 @@ class WanGPSession:
         with _pushd(runtime.root):
             output_dir = self._output_dir if self._output_dir is not None else getattr(runtime.module, "image_save_path", None) or "outputs"
             output_root = os.path.realpath(str(output_dir))
-            # The MCP server has no auth; never let this become an arbitrary-file reader.
-            source_path = os.path.realpath(str(video))
-            if not os.path.normcase(source_path).startswith(os.path.normcase(output_root + os.sep)):
-                raise ValueError(f"'{video}' is outside the outputs directory")
-            if not os.path.isfile(source_path):
-                raise ValueError(f"Video not found: {video}")
+            source_path = _resolve_in_outputs(video, output_root, "Video")
             process_files_def(**magic_mask.query_download_def())
             acquire_GPU_ressources(self._state, magic_mask.PROCESS_ID, magic_mask.PROCESS_NAME)
             try:
@@ -1044,17 +1068,8 @@ class WanGPSession:
             output_dir = self._output_dir if self._output_dir is not None else getattr(runtime.module, "image_save_path", None) or "outputs"
             output_root = os.path.realpath(str(output_dir))
 
-            # The MCP server has no auth; never let this become an arbitrary-file reader.
-            def _inside_outputs(path: str, label: str) -> str:
-                resolved = os.path.realpath(str(path))
-                if not os.path.normcase(resolved).startswith(os.path.normcase(output_root + os.sep)):
-                    raise ValueError(f"'{path}' is outside the outputs directory")
-                if not os.path.isfile(resolved):
-                    raise ValueError(f"{label} not found: {path}")
-                return resolved
-
-            source_path = _inside_outputs(video, "Video")
-            seed_path = _inside_outputs(seed_mask, "Seed mask") if seed_mask else ""
+            source_path = _resolve_in_outputs(video, output_root, "Video")
+            seed_path = _resolve_in_outputs(seed_mask, output_root, "Seed mask") if seed_mask else ""
 
             video_path, frames, fps = magic_mask.prepare_video_mask_input(source_path, max_time_seconds=max_seconds)
             height, width = int(frames.shape[1]), int(frames.shape[2])
