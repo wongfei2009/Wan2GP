@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from shared.attention import pay_attention
 
 from .interrupt import GenerationInterrupted
+from .pdd import MiniMaxH3ParallelHead
 from .sol_attention import MiniMaxH3SolAttention
 from .components.packing import (
     MINIMAX_H3_AUDIO_TAG,
@@ -351,13 +352,17 @@ class DiTBlock(nn.Module):
 
 class FinalLayer(nn.Module):
     def __init__(self, hidden, time_dim, video_dim, audio_dim, eps, apply_silu=True,
-                 adaln_dtype=None, dtype=None, device=None):
+                 adaln_dtype=None, pdd_num_steps=None, dtype=None, device=None):
         super().__init__()
         self.norm = nn.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.adaln_proj = AdalnProj(time_dim, hidden, 2, modalities=1, apply_silu=apply_silu,
                                     dtype=adaln_dtype or dtype, device=device)
-        self.video_out = nn.Linear(hidden, video_dim, bias=True, dtype=torch.float32, device=device)
-        self.audio_out = nn.Linear(hidden, audio_dim, bias=True, dtype=torch.float32, device=device)
+        if pdd_num_steps is None:
+            self.video_out = nn.Linear(hidden, video_dim, bias=True, dtype=torch.float32, device=device)
+            self.audio_out = nn.Linear(hidden, audio_dim, bias=True, dtype=torch.float32, device=device)
+        else:
+            self.video_out = MiniMaxH3ParallelHead(hidden, video_dim, pdd_num_steps, device=device)
+            self.audio_out = MiniMaxH3ParallelHead(hidden, audio_dim, pdd_num_steps, device=device)
 
     def _head(self, h_list, shift, scale, row, output):
         value = self.norm(_take(h_list)).to(scale.dtype)
@@ -439,10 +444,12 @@ class MiniMaxH3Model(nn.Module):
 
         start = time.perf_counter()
         count, architecture, source_width, target_width = convert_adaln_loras(
-            model_type, converted, self.adaln_t_table if self.use_adaln_curves else None)
+            model_type, converted, self.adaln_t_table if self.use_adaln_curves else None,
+            self.hybrid_ref2va_blocks, self.ref2va_adaln_t_table if self.hybrid_ref2va_blocks is not None else None)
         if count:
             source = f"full AdaLN width {source_width}" if source_width == 2688 else f"{architecture.upper()} pruned AdaLN width {source_width}"
-            target = f"full AdaLN width {target_width}" if target_width == 2688 else f"{architecture.upper()} pruned AdaLN width {target_width}"
+            target_architecture = "hybrid FL2VA/REF2VA" if self.hybrid_ref2va_blocks is not None else architecture.upper()
+            target = f"full AdaLN width {target_width}" if target_width == 2688 else f"{target_architecture} pruned AdaLN width {target_width}"
             print(f"MiniMax H3 LoRA: converted {count} AdaLN adapters from {source} to {target} in {time.perf_counter() - start:.2f}s")
         if hasattr(self.blocks[0].attn, "q_proj"):
             return converted
@@ -472,7 +479,7 @@ class MiniMaxH3Model(nn.Module):
                  rope_inv_freq_len=16, rope_theta=10000.0, norm_eps=1e-5, qk_norm_eps=1e-5,
                  final_norm_eps=1e-5, sigma_shift_video=12.0, sigma_shift_audio=3.0,
                  ffn_chunk_size=2048, adaln_curve_grid=None, adaln_dtype=torch.float32, image_model=None,
-                 dtype=None, device=None, **kwargs):
+                 hybrid_ref2va_blocks=None, pdd_num_steps=None, pdd_block_size=None, dtype=None, device=None, **kwargs):
         super().__init__()
         self._interrupt = False
         self.cache = None
@@ -483,12 +490,17 @@ class MiniMaxH3Model(nn.Module):
         self.latents_dim = latents_dim
         self.audio_latents_dim = audio_latents_dim
         self.use_adaln_curves = adaln_curve_grid is not None
+        self.hybrid_ref2va_blocks = hybrid_ref2va_blocks
+        self.pdd_num_steps = pdd_num_steps
+        self.pdd_block_size = pdd_block_size
         video_dim = latents_dim * math.prod(self.patch_size)
         self.video_patch_proj = nn.Linear(video_dim, hidden_size, bias=True, dtype=torch.float32, device=device)
         self.audio_patch_proj = nn.Linear(audio_latents_dim, hidden_size, bias=True, dtype=torch.float32, device=device)
         self.condition_proj = nn.Linear(text_dim, hidden_size, bias=True, dtype=dtype, device=device)
         if self.use_adaln_curves:
             self.register_buffer("adaln_t_table", torch.empty(adaln_curve_grid, time_embed_dim, dtype=adaln_dtype, device=device))
+            if hybrid_ref2va_blocks is not None:
+                self.register_buffer("ref2va_adaln_t_table", torch.empty(adaln_curve_grid, time_embed_dim, dtype=adaln_dtype, device=device))
         else:
             self.time_embedder = TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim,
                                               dtype=torch.float32, device=device)
@@ -504,7 +516,7 @@ class MiniMaxH3Model(nn.Module):
                                                ffn_chunk_size=ffn_chunk_size, sol_attention=self.sol_attention,
                                                dtype=dtype, device=device) for _ in range(num_layers)])
         self.final_layer = FinalLayer(hidden_size, time_embed_dim, video_dim, audio_latents_dim,
-                                      final_norm_eps, **curve, dtype=dtype, device=device)
+                                      final_norm_eps, **curve, pdd_num_steps=pdd_num_steps, dtype=dtype, device=device)
         fp32_modules = [self.video_patch_proj, self.audio_patch_proj, self.final_layer.video_out, self.final_layer.audio_out]
         if self.use_adaln_curves:
             for module in (*[block.adaln_proj.linear for block in self.blocks], self.final_layer.adaln_proj.linear):
@@ -561,10 +573,10 @@ class MiniMaxH3Model(nn.Module):
         payload["layout_signature"], payload["layout"] = signature, layout
         return layout
 
-    def _time_embedding(self, timesteps):
+    def _time_embedding(self, timesteps, table=None):
         if not self.use_adaln_curves:
             return self.time_embedder(timesteps)
-        table = self.adaln_t_table
+        table = self.adaln_t_table if table is None else table
         position = timesteps.clamp(0.0, 1.0) * (table.shape[0] - 1)
         lower = position.floor().long().clamp(max=table.shape[0] - 2)
         return torch.lerp(table[lower], table[lower + 1], (position - lower).unsqueeze(1).to(table.dtype))
@@ -679,6 +691,7 @@ class MiniMaxH3Model(nn.Module):
             segments = [segment for segment in segments if segment[0] < video_start]
             segments.extend(grouped_segments)
         temb = self._time_embedding(timestep)
+        ref2va_temb = self._time_embedding(timestep, self.ref2va_adaln_t_table) if self.hybrid_ref2va_blocks is not None else None
         rope = payload.get("rope")
         if rope is None:
             positions = layout.position_ids.to(torch.float32)
@@ -696,20 +709,23 @@ class MiniMaxH3Model(nn.Module):
         self.sol_attention.begin_forward(layout, device, dtype, payload["attention_sparsity"], target_video_order is not None)
 
         if first_block_cache is None:
-            for block in self.blocks:
+            for block_index, block in enumerate(self.blocks):
                 self._check_interrupt()
                 h_list = [hidden]
                 hidden = None
-                hidden = block(h_list, temb, segments, rope)
+                block_temb = ref2va_temb if ref2va_temb is not None and self.hybrid_ref2va_blocks[0] <= block_index <= self.hybrid_ref2va_blocks[1] else temb
+                hidden = block(h_list, block_temb, segments, rope)
         else:
             self._check_interrupt()
-            hidden, signature = self.blocks[0]([hidden], temb, segments, rope,
+            block_temb = ref2va_temb if ref2va_temb is not None and self.hybrid_ref2va_blocks[0] == 0 else temb
+            hidden, signature = self.blocks[0]([hidden], block_temb, segments, rope,
                                                 residual_signature_elements=first_block_cache.MAX_SIGNATURE_ELEMENTS)
             if first_block_cache.should_compute(signature):
                 head_output = first_block_cache.capture_head_output(hidden[audio_start:])
                 for block_index in range(1, len(self.blocks)):
                     self._check_interrupt()
-                    hidden = self.blocks[block_index]([hidden], temb, segments, rope)
+                    block_temb = ref2va_temb if ref2va_temb is not None and self.hybrid_ref2va_blocks[0] <= block_index <= self.hybrid_ref2va_blocks[1] else temb
+                    hidden = self.blocks[block_index]([hidden], block_temb, segments, rope)
                 first_block_cache.store_tail_residual(hidden[audio_start:], head_output)
             else:
                 first_block_cache.apply_tail_residual(hidden[audio_start:])
@@ -722,7 +738,7 @@ class MiniMaxH3Model(nn.Module):
         hidden = None
         video, audio = self.final_layer(h_list, temb, (video_start, layout.sequence_length, video_head_row),
                                         (audio_start, video_start, audio_row))
-        del temb, rope, timestep_indices
+        del temb, ref2va_temb, rope, timestep_indices
         if target_video_inverse_order is not None:
             video = video.index_select(0, target_video_inverse_order)
         video = _to_dtype([video], video_dtype)
