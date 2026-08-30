@@ -335,6 +335,10 @@ class MiniMaxH3Pipeline:
         self.vae = video_vae
         self.video_encoder = torch.nn.ModuleDict({"encoder": video_vae.encoder, "quant_conv": video_vae.quant_conv})
         self.video_decoder = torch.nn.ModuleDict({"post_quant_conv": video_vae.post_quant_conv, "decoder": video_vae.decoder})
+        # These are profiled as separate MMGP models. Preserve the dtype selected
+        # while loading the VAE instead of applying the transformer's global dtype.
+        self.video_encoder._convertWeightsFloatTo = None
+        self.video_decoder._convertWeightsFloatTo = None
         if torch.cuda.is_available() and torch.cuda.get_device_properties(None).total_memory >= 10 * 1024**3:
             self.video_decoder._budget = 0
         self.audio_vae = audio_vae
@@ -1027,7 +1031,7 @@ class MiniMaxH3Pipeline:
                         keep_grouped_rows_fixed = grouped_masking and denoising_start_step <= step and step + 1 < mask_end_step
                         _reinject_video_source(source_video, source_latents, source_noise, source_mask, stage_sigmas_video[step + 1], source_buffer,
                                                1.0 - VISUAL_COND_TIMESTEP if preserve_input_mask_values or keep_grouped_rows_fixed else None)
-                    video_velocity = audio_velocity = None
+                    video_velocity = audio_velocity = video_denoised = audio_velocity_tail = None
                     if callback is not None:
                         preview = video[0].detach().cpu() if not offline_spectrum or spectrum.replaying else None
                         callback(step, preview, False, denoising_extra=pass_extra, **({"pass_no": pass_no} if pass_no >= 0 else {}))

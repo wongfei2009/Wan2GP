@@ -55,6 +55,7 @@ def _visual_query_without_running_loop(server_config: dict[str, Any], media_reco
     if not is_remote_engine(engine):
         return {"status": "error", "question": question, "answer": "", "error": "A remote Deepy engine requires a remote Visual Inspector. Choose Auto or Same as Deepy."}
     records = list(media_record) if isinstance(media_record, list) else [media_record]
+    video_max_pixels = None if max_image_edge is None else int(max_image_edge) * int(max_image_edge)
     max_image_edge = deepy_vision.VISION_REMOTE_MAX_IMAGE_EDGE if max_image_edge is None else int(max_image_edge)
     images, inspected = [None] * len(records), []
     video_inputs: dict[str, list[tuple[int, int, list[int] | None]]] = {}
@@ -83,7 +84,7 @@ def _visual_query_without_running_loop(server_config: dict[str, Any], media_reco
         inspected.append({"media_id": record.get("media_id", ""), "media_type": media_type, "label": label, "frame_no": resolved_frame, "time_seconds": time_seconds if media_type == "video" else None, "bbox": bbox, **({"path": public_path} if public_path else {})})
     for path, indexed_frames in video_inputs.items():
         bboxes = [item[2] for item in indexed_frames]
-        decode_kwargs = {"max_edge": max_image_edge, **({"bboxes": bboxes} if any(bbox is not None for bbox in bboxes) else {})}
+        decode_kwargs = {**({"max_pixels": video_max_pixels} if video_max_pixels is not None else {"max_edge": max_image_edge}), **({"bboxes": bboxes} if any(bbox is not None for bbox in bboxes) else {})}
         decoded_images = deepy_vision.decode_inspection_video_frames(path, [item[1] for item in indexed_frames], **decode_kwargs)
         for (input_index, _resolved_frame, _bbox), decoded_image in zip(indexed_frames, decoded_images):
             images[input_index] = decoded_image
@@ -239,6 +240,25 @@ def run_remote_deepy_turn(server_config: dict[str, Any], session, text: str, sys
             reasoning_parts.append(event_text)
             _reasoning_id, payload = assistant_chat.upsert_reasoning_block(session, assistant_id, reasoning_block_id, "".join(reasoning_parts))
             _send(send_cmd, payload)
+        elif event.kind == "reasoning_start":
+            finish_answer_segment()
+            set_remote_status("thinking", f"{engine_label} is thinking...", "thinking")
+        elif event.kind == "tool_request_start":
+            finish_reasoning()
+            finish_answer_segment()
+            set_remote_status("tool-request", f"{engine_label} is preparing a tool request...", "tool")
+        elif event.kind == "tool_request_error":
+            finish_reasoning()
+            finish_answer_segment()
+            data = event.data if isinstance(event.data, dict) else {}
+            tool_name = str(data.get("name", "") or "").removeprefix("mcp__wangp__") or "remote_tool"
+            arguments = dict(data.get("input", {}) or {})
+            tool_label = f"{toolbox.get_tool_display_name(tool_name)} Request"
+            ui_tool_id, payload = assistant_chat.add_tool_call(session, assistant_id, tool_name, arguments, tool_label=tool_label)
+            _send(send_cmd, payload)
+            result = {"status": "error", "tool": tool_name, "error": event.text or "The remote provider rejected this tool request before execution."}
+            _send(send_cmd, assistant_chat.complete_tool_call(session, assistant_id, ui_tool_id, result))
+            set_remote_status("waiting", f"Waiting for {engine_label}...", "loading")
         elif event.kind == "usage":
             stats = build_remote_usage_stats(event.data)
             if stats is not None:
@@ -293,7 +313,7 @@ def run_remote_deepy_turn(server_config: dict[str, Any], session, text: str, sys
         active_tool.clear()
         finish_assistant_action(session)
         if not session.interrupt_requested:
-            set_remote_status("thinking", f"{engine_label} is thinking...", "thinking")
+            set_remote_status("waiting", f"Waiting for {engine_label}...", "loading")
         return result
 
     toolbox.bind_runtime_tools(vision_query_callback=lambda record, question, frame=None, max_image_edge=None: _visual_query(server_config, record, question, frame, max_image_edge, toolbox.file_access_policy), tool_progress_callback=tool_progress, vision_is_remote=True)

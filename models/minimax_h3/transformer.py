@@ -416,6 +416,8 @@ class MiniMaxH3Model(nn.Module):
             if key.startswith("lora_unet_"):
                 path, suffix = key[len("lora_unet_"):].split(".", 1)
                 key = path.replace("blocks_", "blocks.", 1).replace("_attn_", ".attn.").replace("_mlp_", ".mlp.") + "." + suffix
+            if key.startswith("token_refiner_blocks."):
+                key = "token_refiner.blocks." + key[len("token_refiner_blocks."):]
             if diffusers_format:
                 diffusers_fc1 = ".ff.net.0.proj." in key
                 for source, target in (("token_refiner.refiner_blocks.", "token_refiner.blocks."),
@@ -441,6 +443,13 @@ class MiniMaxH3Model(nn.Module):
                     value = torch.cat(value.chunk(2, dim=0)[::-1], dim=0).contiguous()
             converted[key] = value
         from .lora_affine import convert_adaln_loras
+
+        if self.use_adaln_curves:
+            ignored = sorted(key for key in converted if key.startswith("time_embedder."))
+            for key in ignored:
+                converted.pop(key)
+            if ignored:
+                print("MiniMax H3 LoRA: ignored unsupported pruned timestep tensors: " + ", ".join(ignored))
 
         start = time.perf_counter()
         count, architecture, source_width, target_width = convert_adaln_loras(
@@ -479,7 +488,8 @@ class MiniMaxH3Model(nn.Module):
                  rope_inv_freq_len=16, rope_theta=10000.0, norm_eps=1e-5, qk_norm_eps=1e-5,
                  final_norm_eps=1e-5, sigma_shift_video=12.0, sigma_shift_audio=3.0,
                  ffn_chunk_size=2048, adaln_curve_grid=None, adaln_dtype=torch.float32, image_model=None,
-                 hybrid_ref2va_blocks=None, pdd_num_steps=None, pdd_block_size=None, dtype=None, device=None, **kwargs):
+                 hybrid_ref2va_blocks=None, pdd_num_steps=None, pdd_block_size=None,
+                 dtype=None, device=None, **kwargs):
         super().__init__()
         self._interrupt = False
         self.cache = None
@@ -630,11 +640,14 @@ class MiniMaxH3Model(nn.Module):
             audio = _to_dtype([audio], audio_dtype)
             return (unpatchify_video_tokens(video, latent_t, latent_h, latent_w, self.latents_dim, self.patch_size),
                     unpack_audio(audio))
-
-        video_rows = patchify_video(video_x.to(torch.float32), self.patch_size)
+        video_x = video_x.to(torch.float32)
+        video_rows = patchify_video(video_x, self.patch_size)
+        video_x= None
         if target_video_order is not None:
             video_rows = video_rows.index_select(0, target_video_order)
-        audio_rows = pack_audio(audio_x.to(torch.float32))
+        audio_x = audio_x.to(torch.float32)
+        audio_rows = pack_audio(audio_x)
+        audio_x = None
         cond_video, cond_audio = payload.get("cond_video_rows"), payload.get("cond_audio_rows")
         if cond_video is not None:
             video_rows = torch.cat((cond_video.to(device), video_rows))
@@ -725,7 +738,9 @@ class MiniMaxH3Model(nn.Module):
                 for block_index in range(1, len(self.blocks)):
                     self._check_interrupt()
                     block_temb = ref2va_temb if ref2va_temb is not None and self.hybrid_ref2va_blocks[0] <= block_index <= self.hybrid_ref2va_blocks[1] else temb
-                    hidden = self.blocks[block_index]([hidden], block_temb, segments, rope)
+                    h_list = [hidden]
+                    hidden = None
+                    hidden = self.blocks[block_index](h_list, block_temb, segments, rope)
                 first_block_cache.store_tail_residual(hidden[audio_start:], head_output)
             else:
                 first_block_cache.apply_tail_residual(hidden[audio_start:])

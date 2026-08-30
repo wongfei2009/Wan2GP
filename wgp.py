@@ -44,7 +44,7 @@ from pathlib import Path
 from datetime import datetime
 import gradio as gr
 from shared.gradio import downloads as gradio_downloads
-from shared.gradio import gradio_model_switch_patch, gradio_queue_focus_patch, video_preview
+from shared.gradio import gradio_model_switch_patch, gradio_queue_focus_patch, gradio_startup_patch, video_preview
 from gradio.themes.utils.sizes import Size
 import random
 import json
@@ -154,7 +154,7 @@ AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 target_mmgp_version = "3.7.14"
-WanGP_version = "12.645"
+WanGP_version = "12.647"
 settings_version = 2.77
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
@@ -1076,6 +1076,7 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
         return err(custom_settings_error)
     inputs["custom_settings"] = parsed_custom_settings
     clear_custom_setting_slots(inputs)
+    inputs["guidance_phases"], inputs["video_prompt_type"] = normalize_phase_2_tiling_selection(model_def, inputs["guidance_phases"], inputs["video_prompt_type"])
     extra_settings_error = extra_settings.validate_inputs(inputs, model_def, get_max_frames=get_max_frames)
     if len(extra_settings_error) > 0:
         return err(extra_settings_error)
@@ -1131,9 +1132,6 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
     loras_multipliers = inputs["loras_multipliers"]
     activated_loras = inputs["activated_loras"]
     guidance_phases= inputs["guidance_phases"]
-    guidance_phases, video_prompt_type = normalize_phase_2_tiling_selection(model_def, guidance_phases, video_prompt_type)
-    inputs["guidance_phases"] = guidance_phases
-    inputs["video_prompt_type"] = video_prompt_type
     model_switch_phase = inputs["model_switch_phase"]    
     switch_threshold = inputs["switch_threshold"]
     switch_threshold2 = inputs["switch_threshold2"]
@@ -2114,7 +2112,11 @@ def load_queue_action(filepath, state, evt:gr.EventData):
             newly_loaded_queue = [ {"id": 0, "params": newly_loaded_queue}]
         else:
             inline_queue_source = newly_loaded_queue
-        newly_loaded_queue, error = _parse_task_manifest(newly_loaded_queue, state, None, None, "[unpack queue]", verbose_output = verbose_output )
+        try:
+            newly_loaded_queue, error = _parse_task_manifest(newly_loaded_queue, state, None, None, "[unpack queue]", verbose_output = verbose_output )
+        except Exception as exception:
+            traceback.print_exc()
+            newly_loaded_queue, error = [], f"Inline queue validation failed: {exception}"
         if error:
             if isinstance(inline_queue_source, dict):
                 inline_queue_source = [{"id": 0, "params": inline_queue_source}]
@@ -2661,6 +2663,7 @@ server_config.setdefault(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY,
 gradio_queue_focus_patch.BACKGROUND_SCHEDULER_DEFAULT_ENABLED = bool(server_config.get(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, 1))
 gradio_queue_focus_patch.install()
 gradio_model_switch_patch.install(verbose=ui_perf_debug)
+gradio_startup_patch.install()
 
 checkpoints_paths = server_config.get("checkpoints_paths", None)
 if checkpoints_paths is None: checkpoints_paths = server_config["checkpoints_paths"] = fl.default_checkpoints_paths
@@ -3174,8 +3177,9 @@ def fix_settings(model_type, ui_defaults, min_settings_version = 0):
 
     model_handler = get_model_handler(base_model_type)
     if hasattr(model_handler, "fix_settings"):
-            model_handler.fix_settings(base_model_type, settings_version, model_def, ui_defaults)
-    apply_custom_settings_defaults(model_def, ui_defaults)
+        model_handler.fix_settings(base_model_type, settings_version, model_def, ui_defaults)
+
+    ui_defaults["settings_version"] = settings_version
 
 def get_default_prompt(i2v):
     if i2v:
@@ -3188,6 +3192,7 @@ def get_factory_settings(model_type):
     model_def = get_model_def(model_type)
     base_model_type = get_base_model_type(model_type)
     ui_defaults = copy.deepcopy(primary_settings)
+    apply_custom_settings_defaults(model_def, ui_defaults)
     ui_defaults.update({
         "settings_version": settings_version,
         "prompt": get_default_prompt(i2v),
@@ -3200,7 +3205,8 @@ def get_factory_settings(model_type):
         ui_defaults.update(copy.deepcopy(model_settings))
     if len(ui_defaults.get("prompt", "")) == 0:
         ui_defaults["prompt"] = get_default_prompt(i2v)
-    fix_settings(model_type, ui_defaults, settings_version)
+    # needs to implement settings md version for defaults/finetunes
+    # fix_settings(model_type, ui_defaults, settings_version)
     return ui_defaults
 
 

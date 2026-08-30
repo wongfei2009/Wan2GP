@@ -46,7 +46,8 @@ def _hybrid_ref2va_blocks(filename):
     return start, end
 
 
-def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, qkv_splitting=True, pdd=False, ref2va_adaln_t_table=None):
+def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, qkv_splitting=True, pdd=False,
+                    ref2va_adaln_t_table=None):
     if qkv_splitting:
         restore_interleaved_h3_qkv(state_dict)
     prefixes = ("model.diffusion_model.", "diffusion_model.")
@@ -122,6 +123,7 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
                       pdd_num_steps=None, pdd_block_size=None):
     checkpoint = probe_h3_checkpoint(filename)
     hybrid_ref2va_blocks = checkpoint.get("hybrid_ref2va_blocks")
+    filenames = list(filename) if isinstance(filename, (list, tuple)) else [filename]
     ref2va_adaln_t_table = None
     if hybrid_ref2va_blocks is not None:
         from .lora_affine import _load_affine_package
@@ -136,13 +138,12 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
         transformer = MiniMaxH3Model(adaln_curve_grid=checkpoint["adaln_curve_grid"], time_embed_dim=checkpoint["time_embed_dim"], adaln_dtype=checkpoint["adaln_dtype"],
                                      hybrid_ref2va_blocks=hybrid_ref2va_blocks, pdd_num_steps=pdd_num_steps,
                                      pdd_block_size=pdd_block_size, dtype=dtype, device="meta")
-    filenames = filename if isinstance(filename, (list, tuple)) else [filename]
     split_map = get_linear_split_map(transformer.attention_inner_size, qkv_layout=qkv_layout) if qkv_splitting and not any(path.lower().endswith(".gguf") for path in filenames) else None
     if split_map is not None:
         offload.split_linear_modules(transformer, split_map)
     transformer.requires_grad_(False)
     preprocess_sd = partial(_strip_wrappers, qkv_splitting=qkv_splitting, pdd=pdd, ref2va_adaln_t_table=ref2va_adaln_t_table)
-    offload.load_model_data(transformer, filename, writable_tensors=False, default_dtype=dtype, preprocess_sd=preprocess_sd,
+    offload.load_model_data(transformer, filenames, writable_tensors=False, default_dtype=dtype, preprocess_sd=preprocess_sd,
                             fused_split_map=split_map)
     transformer.eval().requires_grad_(False)
     transformer.h3_checkpoint_info = checkpoint
