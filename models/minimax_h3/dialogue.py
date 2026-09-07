@@ -21,6 +21,7 @@ H3_DIALOGUE_MAX_REFERENCE_SECONDS = 15.0
 H3_DIALOGUE_AUDIO_SAMPLE_RATE = 32000
 H3_DIALOGUE_PAUSE_SECONDS = 0.18
 H3_DIALOGUE_WORDS_PER_SECOND = 2.6
+H3_DIALOGUE_CJK_SYLLABLES_PER_SECOND = 4.5  # measured on natural Cantonese speech; Whisper cannot trim CJK surplus, so do not undershoot the rate
 H3_DIALOGUE_BOUNDARY_PADDING_SECONDS = 0.14
 H3_DIALOGUE_SILENCE_THRESHOLD = 0.012
 
@@ -41,11 +42,15 @@ Speaker 1:
 WanGP generates every turn as a separate H3 segment, dynamically compiles the full six-section Ref2VA prompt, removes unexpected speech before and after the requested line with Whisper, then joins the turns. Audio Reference 1 belongs to Speaker 1 and Audio Reference 2 to Speaker 2. A speaker without an uploaded reference uses their first generated turn as the voice reference for later turns.
 """
 
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+
+
 _SPEAKER_HEADER = re.compile(r"^\s*Speaker\s*(\d+)\s*(?:\{([^{}\n]*)\})?\s*:\s*", re.IGNORECASE | re.MULTILINE)
 _DIRECTION = re.compile(r"\[([^\[\]\n]+)\]")
 _LANGUAGES = {
     "ar": ("Arabic", "ar"), "arabic": ("Arabic", "ar"), "arabe": ("Arabic", "ar"),
     "zh": ("Chinese", "zh"), "chinese": ("Chinese", "zh"), "chinois": ("Chinese", "zh"), "mandarin": ("Chinese", "zh"),
+    "yue": ("Cantonese", "zh"), "cantonese": ("Cantonese", "zh"), "cantonais": ("Cantonese", "zh"),
     "nl": ("Dutch", "nl"), "dutch": ("Dutch", "nl"), "neerlandais": ("Dutch", "nl"),
     "en": ("English", "en"), "english": ("English", "en"), "anglais": ("English", "en"),
     "fr": ("French", "fr"), "french": ("French", "fr"), "francais": ("French", "fr"),
@@ -146,9 +151,14 @@ def parse_dialogue_prompt(prompt: str) -> list[DialogueTurn]:
 
 
 def _natural_duration(turn: DialogueTurn) -> float:
+    # _normalize_words is ASCII-only, so a Chinese/Japanese/Korean line counts as zero words and
+    # every such turn used to be planned at the 4 s minimum, however long the text: the model then
+    # squeezed or dropped sentences. Count each CJK character as a syllable instead.
     words = len(_normalize_words(turn.text))
-    punctuation = len(re.findall(r"[.!?;:]", turn.text)) * 0.18
-    return max(H3_DIALOGUE_MIN_SEGMENT_SECONDS, min(H3_DIALOGUE_MAX_SEGMENT_SECONDS, words / H3_DIALOGUE_WORDS_PER_SECOND + punctuation + 1.4))
+    syllables = len(_CJK.findall(turn.text))
+    punctuation = len(re.findall(r"[.!?;:\u3002\uff01\uff1f\uff1b\uff1a\uff0c]", turn.text)) * 0.18
+    speech = words / H3_DIALOGUE_WORDS_PER_SECOND + syllables / H3_DIALOGUE_CJK_SYLLABLES_PER_SECOND
+    return max(H3_DIALOGUE_MIN_SEGMENT_SECONDS, min(H3_DIALOGUE_MAX_SEGMENT_SECONDS, speech + punctuation + 1.4))
 
 
 def plan_dialogue(prompt: str, seed: int, duration_seconds: float | None) -> list[DialogueTurn]:
@@ -218,8 +228,12 @@ def load_dialogue_whisper() -> torch.nn.Module:
 
 
 def _normalize_words(text: str) -> list[str]:
-    normalized = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode().casefold()
-    return re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", normalized)
+    # Latin text is accent-stripped and split on non-alphanumerics, as before. CJK scripts have no
+    # spaces, so each character is its own token; without this the expected-word list is empty for a
+    # Chinese line, the turn is planned at the minimum duration and the Whisper trim below never runs,
+    # leaving any stray speech the model adds before the requested line in the output.
+    kept = "".join(ch for ch in unicodedata.normalize("NFKD", str(text or "")) if ord(ch) < 128 or _CJK.match(ch))
+    return re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?|" + _CJK.pattern, kept.casefold())
 
 
 def _fuzzy_match(left: str, right: str) -> bool:
