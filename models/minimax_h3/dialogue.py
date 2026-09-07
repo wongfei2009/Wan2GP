@@ -154,8 +154,9 @@ def _natural_duration(turn: DialogueTurn) -> float:
     # _normalize_words is ASCII-only, so a Chinese/Japanese/Korean line counts as zero words and
     # every such turn used to be planned at the 4 s minimum, however long the text: the model then
     # squeezed or dropped sentences. Count each CJK character as a syllable instead.
-    words = len(_normalize_words(turn.text))
-    syllables = len(_CJK.findall(turn.text))
+    tokens = _normalize_words(turn.text)
+    syllables = sum(1 for token in tokens if _CJK.match(token))
+    words = len(tokens) - syllables
     punctuation = len(re.findall(r"[.!?;:\u3002\uff01\uff1f\uff1b\uff1a\uff0c]", turn.text)) * 0.18
     speech = words / H3_DIALOGUE_WORDS_PER_SECOND + syllables / H3_DIALOGUE_CJK_SYLLABLES_PER_SECOND
     return max(H3_DIALOGUE_MIN_SEGMENT_SECONDS, min(H3_DIALOGUE_MAX_SEGMENT_SECONDS, speech + punctuation + 1.4))
