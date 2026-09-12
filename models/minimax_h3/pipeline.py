@@ -17,7 +17,7 @@ from shared.utils.loras_mutipliers import update_loras_slists
 from shared.utils.text_encoder_cache import TextEncoderCache
 from shared.utils.frame_scheduler import floor_frame_count, normalize_frame_count, normalize_overlap
 from .constants import (H3_AUDIO_REFINEMENT_DENOISE, H3_AUDIO_REFINEMENT_SETTING, H3_AUDIO_REFINEMENT_STEPS,
-                        H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, h3_grouped_masking_enabled)
+                        H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, h3_grouped_masking_enabled, h3_still_frame_index)
 from .dialogue import H3_DIALOGUE_GENERATION, generate_dialogue, is_dialogue_prompt
 from .first_block_cache import MiniMaxH3FirstBlockCache
 from .interrupt import GenerationInterrupted
@@ -1459,7 +1459,8 @@ class MiniMaxH3Pipeline:
         video = None
         if still_image:
             audio = None
-            still = decoded_video[:, :1]
+            keep = h3_still_frame_index(custom_settings)
+            still = decoded_video[:, :1] if keep == 0 else decoded_video[:, -1:]
             if still.dtype == torch.uint8:
                 still = still.float().div_(127.5).sub_(1.0)
             return {"x": still}

@@ -10,6 +10,7 @@ from shared.utils.frame_scheduler import normalize_overlap
 
 from .constants import (H3_AUDIO_REFINEMENT_SETTING, H3_MASK_MODE_DEFAULT, H3_MASK_MODE_GROUPED_ROWS,
                         H3_MASK_MODE_SHARED_TIMESTEP, H3_MASK_MODE_SETTING, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT,
+                        H3_STILL_FRAME_DEFAULT, H3_STILL_FRAME_FIRST, H3_STILL_FRAME_LAST, H3_STILL_FRAME_SETTING,
                         h3_grouped_masking_enabled)
 from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_DIALOGUE_PROMPT_INFOS, load_dialogue_whisper
 from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
@@ -445,6 +446,17 @@ class family_handler:
                     ("Enabled (6 extra steps, denoising 0.5)", "enabled"),
                 ],
                 **({"audio_prompt_type_not": "AK"} if not reference_mode else {}),
+            }, {
+                "id": H3_STILL_FRAME_SETTING,
+                "name": "Still Image Frame",
+                "label": "Still Image Frame",
+                "type": "dropdown",
+                "default": H3_STILL_FRAME_DEFAULT,
+                "choices": [
+                    ("Last frame of the packet [the prompt's change has happened]", H3_STILL_FRAME_LAST),
+                    ("First frame of the packet [closest to the reference]", H3_STILL_FRAME_FIRST),
+                ],
+                "info": "Image output only. H3 plays a prompted change out across the frame packet, so the first frame still looks like the reference and the last is where the change has landed.",
             }],
             "switch_threshold": {
                 "label": "Phase 2 Noise Level Start",
@@ -526,7 +538,7 @@ class family_handler:
             },
         }
         if pdd:
-            result["custom_settings"] = result["custom_settings"][:1]
+            result["custom_settings"] = result["custom_settings"][:1] + result["custom_settings"][-1:]
         if reference_mode:
             result.update({
                 "sliding_window": True,
