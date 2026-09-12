@@ -42,8 +42,8 @@ first_frame_count = frames_offset if frames_offset > 1 else temporal_latent + fr
 frame_counts      = [first + 17*i for i in range(4)]
 ```
 
-For H3 that is **[5, 22, 39, 56]** — the dropdown already offers exactly the
-ComfyUI pack's 5-frame packet, with no H3-specific code.
+For H3 that is **[5, 22, 39, 56]**. But see the VAE floor below: **5 does not
+decode**, so the usable sizes start at 22.
 
 The H3 pipeline also already supports 5 frames natively
 (`models/minimax_h3/pipeline.py:62`):
@@ -56,6 +56,38 @@ def video_latent_frames(frame_count):
 
 `video_latent_frames(5) == 2`. The `17n+5, min 107` rule is a **model_def /
 planner** constraint, not a pipeline one.
+
+### The VAE floor — why the packet is 22 frames, not 5
+
+The denoiser happily produces a 2-latent-frame result, and then the video VAE
+cannot decode it:
+
+```
+RuntimeError: MiniMax H3 VAE decoded 0 frames, expected 5
+```
+
+`components/video_autoencoder.py` decodes in chunks with `clip_length 17`,
+`token_drop 3` and temporal ratio 4, so `tokens_chunk_size = 5` and
+
+```
+num_tokens = latent_frames + token_drop
+num_chunks = (num_tokens + pad) // tokens_chunk_size - int(token_drop > 0)
+```
+
+With 2 latent frames that is `(2+3+0)//5 - 1 = 0` chunks — nothing is written,
+and the write-position check raises. The decoder needs **>= 7 latent frames**,
+and `video_latent_frames(22) == 7` is the next size on the 17n+5 grid:
+
+```
+F= 5  latent=2  chunks=0  -> FAILS
+F=22  latent=7  chunks=1  -> OK
+F=39  latent=12 chunks=2  -> OK
+```
+
+So `frames_minimum_image` is **22**. This is presumably why the ComfyUI pack
+ships an optional dedicated *image* VAE for its 1-frame profiles — the video
+VAE cannot go that short. Taking its "5 frames by default" at face value is
+what produced this failure.
 
 ## The four changes
 

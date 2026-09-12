@@ -405,7 +405,13 @@ class family_handler:
             "dtype": "bf16",
             "fps": 24,
             "frames_minimum": 107,
-            "frames_minimum_image": 5,
+            # Smallest packet the video VAE can actually decode. Its chunked decoder
+            # (clip_length 17, token_drop 3, temporal ratio 4 -> tokens_chunk_size 5)
+            # computes num_chunks = (latents + 3 + pad) // 5 - 1, so the 5-frame packet
+            # the generic image-mode dropdown offers first decodes ZERO chunks and raises
+            # "VAE decoded 0 frames, expected 5". It needs >= 7 latent frames, and
+            # video_latent_frames(22) == 7 is the next size on the 17n+5 grid.
+            "frames_minimum_image": 22,
             "frames_steps": 17,
             "frames_offset": 5,
             "v2i_switch_supported": True,
