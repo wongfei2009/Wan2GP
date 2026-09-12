@@ -193,6 +193,34 @@ LTX-2 gets away without this because it does not condition on fps the same way
 5. Try packet 1 vs 5 vs 22, and first frame vs a middle frame — the video VAE
    is causal, so frame 0 may be the softest one in the packet. Don't assume.
 
+## Verified live (2026-09-13)
+
+`minimax_h3_ref2va_pruned`, one phase, 20 steps, `gguf_q4_k_m`, 1024x768, a
+single `--image-ref` under `KI`:
+
+```
+wangp generate --model minimax_h3_ref2va_pruned --image-ref src.png --ref-as-subject \
+  --set image_mode=1 --resolution 1024x768 --seed 4242 --model-config gguf_q4_k_m \
+  --prompt '<six-section Ref2VA prose naming <Picture 1>>'
+```
+
+- `completed: success=true, files=1` — **one** `.jpg` at 1024x768, so the
+  frame trim fired (the save branch writes every frame it is handed).
+- 22-frame packet: **4.28 s/step**, 20 steps, ~1m41s denoise, ~2m30s total
+  including the model load. For scale, the accidental 107-frame run was
+  **18.9 s/step**.
+- No `Requested frame contribution adjusted` line — the window plan matched.
+- Identity, wardrobe, the window's glazing bars, the candle, the curtain, the
+  lamp and the night grade all carried over from the reference intact, and the
+  camera stayed outside the glass.
+
+**What did NOT land:** the prompt asked her to turn her head toward the candle
+and lower her eyes onto the flame; the result holds the reference's head pose
+and gaze. `KI` preservation appears to dominate a small pose instruction on
+this path — the same "preserve vs. instruct" tension SenseNova `KI` has. Whether
+a stronger instruction, a lower `source_fidelity`-equivalent, or plain `I`
+changes that is **unmeasured**.
+
 ## Open questions
 
 - Why is `frames_minimum` 107? If the sliding-window planner or VDN needs it,
