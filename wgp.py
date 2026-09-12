@@ -7082,7 +7082,10 @@ def generate_media(
     model_filename = get_model_filename(base_model_type)  
 
     frames_offset = model_def.get("frames_offset", 1)
-    video_length = floor_frame_count(video_length, frames_minimum, latent_size, frames_offset)
+    # A video model emitting a still runs a short frame packet (see "frames_minimum_image"),
+    # which a large video-only minimum would otherwise floor back up to a full clip.
+    frames_minimum_floor = model_def.get("frames_minimum_image", frames_minimum) if is_image else frames_minimum
+    video_length = floor_frame_count(video_length, frames_minimum_floor, latent_size, frames_offset)
     if sliding_window_size !=0:
         sliding_window_size = floor_frame_count(sliding_window_size, frames_minimum, latent_size, frames_offset)
     sliding_window_defaults = model_def.get("sliding_window_defaults", {})

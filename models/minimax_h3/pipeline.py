@@ -28,6 +28,7 @@ from .video_vae import LATENTS_MEAN, LATENTS_STD
 
 
 AUDIO_SAMPLE_RATE = 32000
+H3_NATIVE_FPS = 24.0
 AUDIO_LATENT_FPS = 40
 SOL_ATTN_TAU_END = 0.8
 H3_TWO_PHASE_SCALE = 2.0
@@ -695,6 +696,14 @@ class MiniMaxH3Pipeline:
             height = width = 32
             guide_phases = 1
         frame_num = normalize_frame_count(int(frame_num), 5, 17, 5)
+        # Still-image output: H3 stays an audio-video model, so a "still" is the shortest
+        # frame packet the grid allows (5 frames = 2 latent frames), decoded with the video
+        # VAE; one frame is kept and the audio VAE is never run. See wgp.py's image_mode.
+        still_image = int(kwargs.get("image_mode", 0) or 0) > 0 and not self.audio_only
+        if still_image:
+            # wgp.py sets fps to 1 for image output, but H3 conditions the DiT on fps and
+            # sizes the audio latent block from it, so keep the model's native rate.
+            fps = H3_NATIVE_FPS
         audio_from_control_video = not self.reference_mode and "2" in (audio_prompt_type or "")
         prefix_frames_count, overlap_error = normalize_overlap(int(prefix_frames_count or 0), 17, 1)
         if overlap_error:
@@ -1448,6 +1457,12 @@ class MiniMaxH3Pipeline:
             else:
                 decoded_video = frozen_target_video[:, :target_frames].cpu()
         video = None
+        if still_image:
+            audio = None
+            still = decoded_video[:, :1]
+            if still.dtype == torch.uint8:
+                still = still.float().div_(127.5).sub_(1.0)
+            return {"x": still}
         decoded_audio = self.audio_vae.decode(audio)[0]
         audio = None
         target_samples = round(target_frames / fps * AUDIO_SAMPLE_RATE)
