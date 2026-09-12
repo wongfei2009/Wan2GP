@@ -214,12 +214,37 @@ wangp generate --model minimax_h3_ref2va_pruned --image-ref src.png --ref-as-sub
   lamp and the night grade all carried over from the reference intact, and the
   camera stayed outside the glass.
 
-**What did NOT land:** the prompt asked her to turn her head toward the candle
-and lower her eyes onto the flame; the result holds the reference's head pose
-and gaze. `KI` preservation appears to dominate a small pose instruction on
-this path — the same "preserve vs. instruct" tension SenseNova `KI` has. Whether
-a stronger instruction, a lower `source_fidelity`-equivalent, or plain `I`
-changes that is **unmeasured**.
+### The kept frame is what decides whether it edits — not the reference mode
+
+The first run held the reference's head pose and gaze, ignoring the prompt's
+"she has turned her head toward the candle". The obvious suspect was `KI`
+preservation, so the same seed and prompt were rerun with plain `I`. Measured
+(MAE, 1024x768):
+
+| comparison | MAE |
+|---|---|
+| `KI` vs reference | 0.0235 |
+| `I` vs reference | 0.0234 |
+| **`KI` vs `I`** | **0.0039** |
+| **first frame vs last frame** | **0.0334** |
+
+`I` and `KI` produced *the same image* — 0.0039 is about JPEG-noise level. The
+reference mode was never the variable. **The kept frame was**, at 8.6x the
+difference.
+
+H3 is a video model: a prompted change plays out *across* the packet. Frame 0 is
+the frame where nothing has happened yet, so the reference dominates however it
+was attached — which is exactly what both runs returned. Keeping the **last**
+frame of the 22-frame packet returns the instruction carried out: she has turned
+toward the candle and lowered her eyes, with wardrobe, window geometry, candle,
+curtain and grade all still intact.
+
+Hence `h3_still_frame` (`last` default / `first`), reachable per run with
+`--set custom_settings='{"h3_still_frame":"first"}'`.
+
+The cost of `last` is ~0.9 s of drift: framing shifts slightly and hair detail
+moves (in the verification run one bun loosened). So the two modes are a genuine
+choice — `first` is a faithful re-render of the reference, `last` is an edit.
 
 ## Open questions
 
