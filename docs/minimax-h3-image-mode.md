@@ -70,9 +70,10 @@ planner** constraint, not a pipeline one.
 On Ref2VA also set `image_video_prompt_type` so switching to the image tab adds
 the reference letters itself (`wgp.py:10208` reads it, default `"KI"`).
 
-### 2. Stop the 107 floor clobbering the packet — `wgp.py:7084`
+### 2. Stop the 107 floor clobbering the packet — `wgp.py:7026`
 
-This is the one real blocker. Today:
+This is the one real blocker, and it bites in **two** places, which the first
+attempt at this patch missed. Today:
 
 ```python
 video_length = floor_frame_count(video_length, frames_minimum, latent_size, frames_offset)
@@ -89,6 +90,25 @@ video_length = floor_frame_count(video_length, floor_minimum, latent_size, frame
 ```
 
 Every other model keeps today's behaviour (the key is absent → `frames_minimum`).
+
+**Patching only `floor_frame_count` is not enough.** The sliding-window plan
+(`build_default_window_plan`, `wgp.py:7342`) takes its own `minimum=frames_minimum`
+and re-floors the packet, which the job events report as:
+
+```
+Requested frame contribution adjusted from 5 to 107 for model-compatible scheduling (Sliding Window 1)
+```
+
+— i.e. `success=true` and a 4.5-second video where a still was asked for. So the
+rebinding happens **once, at the assignment** (`wgp.py:7026`), and every
+downstream floor and window plan inherits it. Verified offline against the real
+scheduler:
+
+```
+build_default_window_plan(total_frames=5, window_size=362, step=17, frame_offset=5, ...)
+  minimum=107 -> [(frame_num 107, output 107, requested 5)]
+  minimum=5   -> [(frame_num 5,   output 5,   requested None)]
+```
 
 ### 3. Trim to one frame and drop audio — `models/minimax_h3/pipeline.py`
 
