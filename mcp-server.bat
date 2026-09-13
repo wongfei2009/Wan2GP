@@ -14,6 +14,14 @@ REM shared/mcp_files.py) -- the separate `uploadserver` process on port 7860
 REM that this script used to start is gone. Port 7860 stays free for
 REM web-ui.bat's Gradio UI.
 REM
+REM --mcp-api-version 1 is REQUIRED for the `wangp` CLI, as of WanGP 13.
+REM Upstream made API v2 the default: build_server_for_session's api_tool()
+REM registers NOTHING under v2 and shared/mcp_v2.py registers a different,
+REM compact tool surface instead -- so wangp_generate / wangp_get_job /
+REM wangp_list_models simply vanish and every CLI call fails as an unknown
+REM tool. The fork-only tools stay registered either way (they use @mcp.tool()
+REM directly), which makes the breakage look partial rather than total.
+REM
 REM --mcp-allow-read-file-system is REQUIRED for the `wangp` CLI, as of WanGP
 REM 12.60. Upstream now routes every generation through _resolve_generation_media
 REM and rejects filesystem paths by default, for every attachment key the CLI
@@ -107,4 +115,4 @@ REM Make sure the outputs folder exists before serving it
 if not exist outputs mkdir outputs
 
 REM Run the MCP server (which also serves /files/*) in the foreground
-python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --mcp-allow-read-file-system --profile %PROFILE% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED%
+python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --mcp-allow-read-file-system --mcp-api-version 1 --profile %PROFILE% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED%

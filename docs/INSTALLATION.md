@@ -238,3 +238,7 @@ These kernels accelerate bitsandbytes 4-bit / NF4 checkpoints. Install them afte
 ```
 pip install bitsandbytes==0.49.2
 ```
+
+---
+
+> Applies to: Manual installation and dependencies on Windows and Linux. Requirements vary by operating system and GPU; the commands in this guide concern installation and launch.

@@ -658,12 +658,14 @@ class WanGPSession:
     def get_model_defs(self, **filters: Any) -> list[dict[str, Any]]:
         return self.list_model_defs(**filters)
 
-    def list_model_metadata(self, include_availability: bool = False, **filters: Any) -> list[dict[str, Any]]:
+    def list_model_metadata(self, include_availability: bool = False, include_selection: bool = False, **filters: Any) -> list[dict[str, Any]]:
         metadata_records = []
         for model_def in self.list_model_defs(**filters):
             metadata = copy.deepcopy(model_def.get("metadata", {}))
             metadata.setdefault("model_type", str(model_def.get("model_type") or ""))
             metadata["name"] = model_def.get("name", metadata.get("model_type", ""))
+            if include_selection:
+                metadata.update(self.get_model_selection_metadata(metadata["model_type"]))
             metadata_records.append(metadata)
         if include_availability:
             self._add_availability_to_metadata(metadata_records)
@@ -699,7 +701,15 @@ class WanGPSession:
         settings["model_type"] = str(model_type)
         return settings
 
-    def get_model_settings(self, model_type: str, setting_id: str | None = None) -> dict[str, Any]:
+    def get_model_selection_metadata(self, model_type: str) -> dict[str, Any]:
+        runtime = self._ensure_runtime()
+        with _pushd(runtime.root):
+            model_def = runtime.module.get_model_def(model_type)
+            selection = {key: copy.deepcopy(model_def[key]) for key in ("size", "specialities") if key in model_def}
+            selection["accelerated"] = "native" if model_def.get("accelerated") == "native" else "profiles" if any(group == "accelerator_profiles" and paths for group, _, paths in runtime.module._get_builtin_lset_groups(model_type)) else "none"
+            return selection
+
+    def get_model_settings(self, model_type: str, setting_id: str | None = None, *, include_selection: bool = False) -> dict[str, Any]:
         runtime = self._ensure_runtime()
         with _pushd(runtime.root):
             model_def = runtime.module.get_model_def(model_type)
@@ -712,6 +722,9 @@ class WanGPSession:
                 entries += [{"id": f"{prefix}:{str(path).replace(chr(92), '/')}", "type": setting_type, "_path": runtime.module._builtin_lset_file_path(path)} for path in paths]
             lora_dir = Path(runtime.module.get_lora_dir(model_type))
             entries += [{"id": f"user_settings:{path.name}", "type": "user settings", "_path": str(path)} for path in sorted((*lora_dir.glob("*.json"), *lora_dir.glob("*.zip")), key=lambda path: path.name.casefold())]
+            if include_selection:
+                from shared.model_selection import prioritize_profiles
+                entries = prioritize_profiles(entries)
             if setting_id is None:
                 return {"model_type": str(model_type), "settings": [{key: value for key, value in entry.items() if key != "_path"} for entry in entries]}
             entry = next((entry for entry in entries if entry["id"] == setting_id), None)
@@ -726,6 +739,8 @@ class WanGPSession:
                 content = manifest[0].get("params", manifest[0])
             else:
                 content = json.loads(path.read_text(encoding="utf-8"))
+            if include_selection:
+                content.pop("profile_priority", None)
             return {"model_type": str(model_type), "id": entry["id"], "type": entry["type"], "content": content}
 
     def merge_settings_with_defaults(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -740,6 +755,7 @@ class WanGPSession:
                 raise ValueError(f"Unknown model_type: {model_type}")
             merged = copy.deepcopy(runtime.module.get_factory_settings(model_type))
             merged.update(copy.deepcopy(settings))
+            merged.pop("profile_priority", None)
             runtime.module.clean_settings(model_type, merged)
             merged["settings_version"] = runtime.module.settings_version
         merged["model_type"] = model_type
@@ -1118,8 +1134,8 @@ class WanGPSession:
         task = self._normalize_task(settings, task_index=1)
         return self._submit_tasks([self._absolutize_task_paths(task, caller_base_path)], callbacks=callbacks)
 
-    def submit_media_postprocessing(self, media_source: str | os.PathLike[str], *, temporal_upsampling: str = "", spatial_upsampling: str = "", spatial_upsampler_prompt: str = "", spatial_upsampler_reference_images: list[str] | None = None, spatial_upsampler_face_count: int = 1, film_grain_intensity: float = 0, film_grain_saturation: float = 0.5, seed: int = -1, api_options: dict[str, Any] | None = None, return_media: bool = False, callbacks: object | None = None, **settings_overrides: Any) -> SessionJob:
-        settings = build_media_postprocessing_settings(media_source, temporal_upsampling=temporal_upsampling, spatial_upsampling=spatial_upsampling, spatial_upsampler_prompt=spatial_upsampler_prompt, spatial_upsampler_reference_images=spatial_upsampler_reference_images, spatial_upsampler_face_count=spatial_upsampler_face_count, film_grain_intensity=film_grain_intensity, film_grain_saturation=film_grain_saturation, seed=seed, api_options=api_options, return_media=return_media, **settings_overrides)
+    def submit_media_postprocessing(self, media_source: str | os.PathLike[str], *, temporal_upsampling: str = "", spatial_upsampling: str = "", spatial_upsampler_prompt: str = "", spatial_upsampler_reference_images: list[str] | None = None, spatial_upsampler_param: float | None = None, spatial_upsampler_param2: float | None = None, film_grain_intensity: float = 0, film_grain_saturation: float = 0.5, seed: int = -1, api_options: dict[str, Any] | None = None, return_media: bool = False, callbacks: object | None = None, **settings_overrides: Any) -> SessionJob:
+        settings = build_media_postprocessing_settings(media_source, temporal_upsampling=temporal_upsampling, spatial_upsampling=spatial_upsampling, spatial_upsampler_prompt=spatial_upsampler_prompt, spatial_upsampler_reference_images=spatial_upsampler_reference_images, spatial_upsampler_param=spatial_upsampler_param, spatial_upsampler_param2=spatial_upsampler_param2, film_grain_intensity=film_grain_intensity, film_grain_saturation=film_grain_saturation, seed=seed, api_options=api_options, return_media=return_media, **settings_overrides)
         return self.submit_task(settings, callbacks=callbacks)
 
     def submit_audio_remux(self, video_source: str | os.PathLike[str], *, postprocess_audio: str, audio_source: str | os.PathLike[str] | None = None, postprocess_audio_prompt: str = "", postprocess_audio_neg_prompt: str = "", seed: int = -1, repeat_generation: int = 1, replace_voice_sample: str | os.PathLike[str] | None = None, replace_voice_sample2: str | os.PathLike[str] | None = None, api_options: dict[str, Any] | None = None, return_media: bool = False, callbacks: object | None = None, **settings_overrides: Any) -> SessionJob:
@@ -1769,7 +1785,7 @@ class WanGPSession:
         return min(90, 20 + int(ratio * 65))
 
 
-def build_media_postprocessing_settings(media_source: str | os.PathLike[str], *, temporal_upsampling: str = "", spatial_upsampling: str = "", spatial_upsampler_prompt: str = "", spatial_upsampler_reference_images: list[str] | None = None, spatial_upsampler_face_count: int = 1, film_grain_intensity: float = 0, film_grain_saturation: float = 0.5, seed: int = -1, api_options: dict[str, Any] | None = None, return_media: bool = False, **settings_overrides: Any) -> dict[str, Any]:
+def build_media_postprocessing_settings(media_source: str | os.PathLike[str], *, temporal_upsampling: str = "", spatial_upsampling: str = "", spatial_upsampler_prompt: str = "", spatial_upsampler_reference_images: list[str] | None = None, spatial_upsampler_param: float | None = None, spatial_upsampler_param2: float | None = None, film_grain_intensity: float = 0, film_grain_saturation: float = 0.5, seed: int = -1, api_options: dict[str, Any] | None = None, return_media: bool = False, **settings_overrides: Any) -> dict[str, Any]:
     settings = {
         "mode": "edit_postprocessing",
         "prompt": "Media postprocessing",
@@ -1779,7 +1795,8 @@ def build_media_postprocessing_settings(media_source: str | os.PathLike[str], *,
         "spatial_upsampling": spatial_upsampling or "",
         "spatial_upsampler_prompt": spatial_upsampler_prompt,
         "spatial_upsampler_reference_images": list(spatial_upsampler_reference_images or []),
-        "spatial_upsampler_face_count": spatial_upsampler_face_count,
+        "spatial_upsampler_param": spatial_upsampler_param,
+        "spatial_upsampler_param2": spatial_upsampler_param2,
         "film_grain_intensity": film_grain_intensity,
         "film_grain_saturation": film_grain_saturation,
         "postprocess_audio": "",
