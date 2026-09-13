@@ -1050,7 +1050,13 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
 
     prompts = prompt_parser.split_prompt_units(prompt, multi_prompts_gen_type)
     if len(prompts) == 0:
-        return err("Prompt cannot be empty.")
+        # Some models treat the prompt as optional: YuE2 reads an EMPTY lyrics
+        # field as "instrumental, no vocals" and takes the musical direction from
+        # alt_prompt instead. split_prompt_units returns [] for "", so such a
+        # model still needs exactly one (empty) unit to reach the handler.
+        if not model_def.get("allow_empty_prompt", False):
+            return err("Prompt cannot be empty.")
+        prompts = [""]
     if single_prompt and multi_prompts_gen_type in {"G", "PG"} and len(prompts) > 1:
         return err(f"multi_prompts_gen_type='{multi_prompts_gen_type}' parses this prompt into {len(prompts)} separate generation requests, but this submission accepts one generation task. Submit separate tasks or use 'FG' if the line breaks belong to one prompt.")
     window_boundary_error = prompt_parser.validate_sliding_window_prompt_boundaries(prompts, multi_prompts_gen_type, inputs.get("image_end"))
@@ -7113,6 +7119,8 @@ def generate_media(
 
     prompt_has_history = str(prompt or "").startswith(prompt_parser.PROMPT_UNIT_PREFIX)
     prompts = prompt_parser.split_prompt_units(prompt, multi_prompts_gen_type)
+    if len(prompts) == 0 and model_def.get("allow_empty_prompt", False):
+        prompts = [""]
     display_prompts = prompts.copy()
     display_original_prompts = prompt_parser.split_prompt_units(prompt, multi_prompts_gen_type, originals=True) if prompt_has_history else display_prompts.copy()
     alt_prompt_inherits = bool(model_def.get("alt_prompt_inherits_prompt_paragraphs", False))

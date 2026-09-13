@@ -111,6 +111,12 @@ class family_handler:
             "alt_prompt_inherits_prompt_paragraphs": True,
             "alt_prompt": {"label": "Music Style", "placeholder": "Language, genre, instruments, mood, vocal character and tempo", "lines": 3},
             "model_modes": {"choices": [("Melody and chords", 0), ("Melody only", 1), ("Direct generation", 2)], "default": 0, "label": "Composition Planning"},
+            # An EMPTY lyrics field is YuE2's own way to ask for an instrumental
+            # (upstream: leave it empty, never write "[Instrumental]" as a lyric
+            # line, and put the instrumental intent in the style prompt).
+            # SongRequest already accepts lyrics="" -- only wgp.py's generic
+            # "Prompt cannot be empty" guard stood in the way, so opt out of it.
+            "allow_empty_prompt": True,
             "any_audio_prompt": True, "audio_prompt_choices": True, "audio_guide_label": "Source Song (Music to Transcribe)",
             "audio_prompt_type_sources": {"selection": ["", "A"], "labels": {"": "No Audio", "A": "Extract Score from Source Song"}, "default": "", "label": "Source Audio", "letters_filter": "A"},
             "custom_settings": [{"id": "abc", "name": "ABC Score", "label": "Optional ABC score (planning modes only)", "type": "text", "default": "", "audio_prompt_type_not": "A"}],
@@ -146,8 +152,11 @@ class family_handler:
 
     @staticmethod
     def validate_generative_prompt(base_model_type, model_def, inputs, one_prompt):
-        if not one_prompt.strip() or not inputs["alt_prompt"].strip():
-            return "YuE2 requires lyrics and a music style."
+        if not inputs["alt_prompt"].strip():
+            return "YuE2 requires a music style."
+        # Lyrics are OPTIONAL: an empty field asks for an instrumental, with the
+        # arrangement taken from the style prompt. Writing "[Instrumental]" as a
+        # lyric line is the wrong way to ask -- it is sung material to the model.
         scoring = "A" in inputs["audio_prompt_type"]
         if scoring and inputs["audio_guide"] is None:
             return "Upload a source song to extract its score."
