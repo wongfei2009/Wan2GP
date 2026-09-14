@@ -69,10 +69,35 @@ REM                  VAE / vision + video encoders unpinned ("no reserved RAM
 REM                  left. Transfer speed ... may be slower"). SPEED ONLY -- it
 REM                  cannot fix a CUDA OOM. Must stay BELOW 0.5.
 REM
-REM   PROFILE        mmgp memory profile 1-5 (wgp.py default 4 = LowRAM_LowVRAM).
-REM                  Try 5 (VerylowRAM_LowVRAM, offloads hardest) if lowering
-REM                  VRAM_SAFETY alone is not enough. With 64 GB of RAM, 2
-REM                  (HighRAM_LowVRAM) may instead be faster once it fits.
+REM   PROFILE        mmgp memory profile 1-5. DELIBERATELY UNSET BY DEFAULT --
+REM                  setting it is NOT free, because --profile is a global
+REM                  FORCE, not a default. WanGP already keeps a separate
+REM                  memory profile PER OUTPUT TYPE (server_config's
+REM                  video_profile / image_profile / audio_profile, the last
+REM                  defaulting to 3.5), and wgp.py:3388-3390 collapses all
+REM                  three onto --profile whenever it is passed.
+REM
+REM                  That collapse costs real speed on AUDIO. The cg/vllm LM
+REM                  decoder engines require a profile that keeps the model
+REM                  wholly in VRAM -- wgp.py:4142 tests int(profile) in [1,3],
+REM                  which 3.5 passes and 4 does not -- so forcing 4 silently
+REM                  dropped every autoregressive audio model (YuE2, ACE-Step,
+REM                  MiniMax Music, Kugel) onto the legacy decoder:
+REM                    "Unable to use LM Engine 'vllm' as it requires a Memory
+REM                     Profile such as 1,3 or 3+ ... Switching to Legacy"
+REM                    "[YuE2] AR LM engine: legacy (CUDA graphs: off; Triton
+REM                     decoder kernels: off; attention: PyTorch SDPA)"
+REM                  Upstream says the same in docs/CHANGELOG.md for Kugel
+REM                  Audio: 16GB VRAM + profile 1/3/3+, "or you will have to go
+REM                  the slow way with other Profiles".
+REM
+REM                  So leave it unset and let the server pick per type. Set it
+REM                  only to force one for a whole launch: 5
+REM                  (VerylowRAM_LowVRAM, offloads hardest) if lowering
+REM                  VRAM_SAFETY alone is not enough for a big VIDEO model, or
+REM                  2 (HighRAM_LowVRAM) which may be faster once it fits with
+REM                  64 GB of RAM. Doing so re-flattens audio back onto the
+REM                  legacy decoder, so prefer per-launch over permanent.
 REM
 REM Change one at a time so it stays clear which one moved the needle.
 REM
@@ -89,6 +114,7 @@ REM #                                                                         #
 REM #    H3 Pruned 20B (fl2va/ref2va_pruned) .. set "VRAM_SAFETY=0.5"         #
 REM #    H3 Full 33B   (fl2va/ref2va) ........ set "VRAM_SAFETY=0.35"         #
 REM #                                          then 0.3, then PROFILE=5       #
+REM #    (PROFILE=5 re-flattens audio to the legacy LM decoder -- see above)  #
 REM #    MiniMax Music 3 / audio ............. 0.8 (the default) -- see below #
 REM #                                                                         #
 REM #  e.g.  set "VRAM_SAFETY=0.5" && mcp-server.bat                          #
@@ -107,7 +133,9 @@ REM song, linear -- 30 s took ~17.5 min, 120 s took 1h08m. Re-measure after.
 REM ---------------------------------------------------------------------------
 if "%VRAM_SAFETY%"==""   set VRAM_SAFETY=0.8
 if "%PERC_RESERVED%"=="" set PERC_RESERVED=0.45
-if "%PROFILE%"==""       set PROFILE=4
+REM No default: an unset PROFILE means "let WanGP choose per output type".
+set "PROFILE_ARG="
+if not "%PROFILE%"=="" set "PROFILE_ARG=--profile %PROFILE%"
 
 call venv\Scripts\activate.bat
 
@@ -115,4 +143,4 @@ REM Make sure the outputs folder exists before serving it
 if not exist outputs mkdir outputs
 
 REM Run the MCP server (which also serves /files/*) in the foreground
-python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --mcp-allow-read-file-system --mcp-api-version 1 --profile %PROFILE% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED%
+python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --mcp-allow-read-file-system --mcp-api-version 1 %PROFILE_ARG% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED%
