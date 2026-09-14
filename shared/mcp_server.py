@@ -21,6 +21,26 @@ if TYPE_CHECKING:
 
 
 _MAX_STORED_EVENTS = 500
+
+# Fork-only: a separate ring for the server's own LOG LINES, so the progress
+# firehose cannot evict them.
+#
+# Why this exists: the events list above is one ring shared by every event kind,
+# and progress dominates it (399 of 500 in a sampled snapshot). A model-load
+# banner -- the one place the server says which LM decoder engine, memory profile
+# and attention backend a job actually got -- is emitted in the first second and
+# is gone within about seven, so "what did this job really run on?" was
+# unanswerable after the fact. `success=true` never covered it.
+#
+# Two details make it work where a naive "ring for stream events" would not:
+#   * tqdm redraws ARE stream events (they carry a "%|" bar and arrive per
+#     step), so they are dropped here or they would evict the banner themselves.
+#   * HEAD and TAIL are both kept. Configuration is announced once at load
+#     (head); a late warning -- an accelerator LoRA being disabled, a fallback
+#     being taken -- arrives mid-job (tail). The uninteresting middle is what
+#     gets dropped.
+_MAX_STORED_LOG_HEAD = 120
+_MAX_STORED_LOG_TAIL = 80
 _MEDIA_TRANSFER_TTL_SECONDS = 600
 _MAX_UPLOAD_BYTES = 8 * 1024**3
 _TRANSPORT_ALIASES = {
@@ -1140,6 +1160,9 @@ class _JobRecord:
         self.created_at = time.time()
         self.updated_at = self.created_at
         self.events: list[dict[str, Any]] = []
+        self.log_head: list[dict[str, Any]] = []
+        self.log_tail: list[dict[str, Any]] = []
+        self.log_dropped = 0
         self.result: dict[str, Any] | None = None
         self._lock = threading.Lock()
         self._watcher = threading.Thread(target=self._watch, daemon=True, name=f"wangp-mcp-job-{job_id}")
@@ -1154,10 +1177,34 @@ class _JobRecord:
                 self.events.append(event_dict)
                 if len(self.events) > _MAX_STORED_EVENTS:
                     del self.events[: len(self.events) - _MAX_STORED_EVENTS]
+                self._record_log(event_dict)
                 self.updated_at = time.time()
                 if event.kind == "completed" and type(event.data).__name__ == "GenerationResult":
                     self.result = _result_to_dict(event.data)
         self._capture_result_if_done()
+
+    def _record_log(self, event_dict: dict[str, Any]) -> None:
+        """Keep a job's log lines out of the progress firehose. Caller holds the lock."""
+        if event_dict.get("kind") != "stream":
+            return
+        data = event_dict.get("data")
+        if not isinstance(data, dict):
+            return
+        text = str(data.get("text") or "").strip()
+        if not text:
+            return
+        # A tqdm redraw, not a log line. These arrive once per step and would
+        # push the load banner out of both ends within seconds.
+        if "%|" in text and data.get("stream") == "stderr":
+            return
+        entry = {"timestamp": event_dict.get("timestamp"), "stream": data.get("stream"), "text": text}
+        if len(self.log_head) < _MAX_STORED_LOG_HEAD:
+            self.log_head.append(entry)
+            return
+        self.log_tail.append(entry)
+        if len(self.log_tail) > _MAX_STORED_LOG_TAIL:
+            del self.log_tail[: len(self.log_tail) - _MAX_STORED_LOG_TAIL]
+            self.log_dropped += 1
 
     def _capture_result_if_done(self) -> None:
         if not self.job.done:
@@ -1178,6 +1225,10 @@ class _JobRecord:
             events = copy.deepcopy(self.events[-event_limit:] if event_limit else [])
             result = copy.deepcopy(self.result)
             updated_at = self.updated_at
+            log = copy.deepcopy(self.log_head)
+            if self.log_dropped:
+                log.append({"timestamp": None, "stream": "wangp", "text": f"... {self.log_dropped} log line(s) omitted ..."})
+            log.extend(copy.deepcopy(self.log_tail))
         if isinstance(result, dict):
             generated_paths = {(self.session._root / path).resolve() for path in result.get("generated_files", [])}
             result["gallery_items"] = [_compact_gallery_record(record) for record in _gallery_records(self.session, limit=500) if (self.session._root / record["path"]).resolve() in generated_paths]
@@ -1190,6 +1241,7 @@ class _JobRecord:
             "created_at": self.created_at,
             "updated_at": updated_at,
             "events": events,
+            "log": log,
             "result": result,
         }
 
