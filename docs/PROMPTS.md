@@ -247,6 +247,16 @@ Important practical limitation:
 
 - only one `Start Image` is supported in this mode
 
+#### Injecting Frames Across Windows
+
+For models with **Inject Frames**, add your images under **Reference Images** and enter comma-separated tokens in **Positions of Injected Frames**:
+
+- A frame number, such as `1`, injects the next image at that position (`1` is the first frame).
+- `L` injects the next image at the end of the next window.
+- `X` skips that window without consuming an image. Repeat it to delay injection for multiple windows.
+
+For example, `L, L, X, L, L` uses four images at the ends of windows 1, 2, 4, and 5. Window 3 has no new frame injection. `L, X, X, L` injects two images at the ends of windows 1 and 4. Lowercase `l` and `x` also work. Enter these tokens in the positions field, not in the text prompt.
+
 #### Optional `[/...]` Window Commands
 
 Sliding-window prompts can include optional slash commands in brackets. WanGP removes these commands before sending the prompt text to the model. Brackets that do not start with `/` are ignored by this parser and remain available for model-specific prompt syntax such as Prompt Relay.
@@ -260,9 +270,12 @@ Generic WanGP window commands:
 - `[/overlap=9]`: use 9 overlap frames for this window, rounded to the model's overlap frame step
 - `[/overlap=0]`: use no overlap frames, when the model supports text-to-video windows
 - `[/new_shot]`: start this window without overlap frames, creating a hard transition, it is an alias for `[/overlap=0]`
+- `[/no_end_image]`: skip this window's End Image without consuming it. The next window without this command uses the next unused End Image. Repeat the command on consecutive window prompts to skip several windows; it takes no value and does not affect Inject Frames or overlap.
 - `[/loras_mult=1;3]`: override the active LoRA multipliers for this window only. The selected LoRAs stay the same; use the same syntax as the LoRAs Multipliers field, such as `[/loras_mult=1;3 0.5;0.5]` for two active LoRAs. Windows without `[/loras_mult=...]` use the normal LoRA multipliers from the UI/default settings.
 
 Use `[/new_shot]` when a window should behave like a hard cut: a new scene, a new character introduction, or the first generated window after Continue Video when the source video should remain in the final output but should not visually condition the new generated window.
+
+For example, with four End Images and five window prompts, add `[/no_end_image]` to the third prompt to use the images in windows 1, 2, 4, and 5. This command applies only to the marked window; automatically added windows use End Images normally.
 
 Multiple commands can be combined in one bracket, for example `[/duration=5s,/overlap=9]`, `[/duration=4s,/new_shot]`, or `[/duration=5s,/loras_mult=1;3]`.
 
