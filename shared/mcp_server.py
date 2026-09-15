@@ -199,7 +199,45 @@ def _error_to_dict(error: Any) -> dict[str, Any]:
     }
 
 
+def _materialize_side_files(result: Any) -> None:
+    """Save model-provided companion files (YuE2's .abc/.mid score) next to their media.
+
+    Side files reach us as BYTES, never as files: shared/api.py forces
+    return_side_files=True on every API-submitted task, which makes
+    process_side_files() hand the bytes back instead of writing them (that
+    branch exists for in-process API consumers that transfer bytes directly).
+    An MCP v1 consumer cannot use them that way -- our whole contract is paths,
+    and _artifact_to_dict() cannot serialize bytes at all -- so this is where
+    they become files and join generated_files, which is the only list the CLI
+    downloads. Model-agnostic: any handler that fills samples["side_files"]
+    gets this; YuE2 is simply the first.
+
+    Mutates result.generated_files in place. GenerationResult is frozen but the
+    list is not, and both _result_to_dict() call sites share one instance, so
+    re-serializing the same result (every poll hits this) stays a no-op.
+    """
+
+    for artifact in getattr(result, "artifacts", ()) or ():
+        side_files = getattr(artifact, "side_files", None) or {}
+        if not side_files or not artifact.path:
+            continue
+        parent = Path(artifact.path).parent
+        for filename, content in side_files.items():
+            # process_side_files() already derived and validated each filename.
+            target = parent / filename
+            resolved = str(target.resolve())
+            if resolved in result.generated_files:
+                continue
+            try:
+                target.write_bytes(content)
+            except OSError as exc:
+                logging.getLogger(__name__).warning("Could not save side file %s: %s", target, exc)
+                continue
+            result.generated_files.append(resolved)
+
+
 def _result_to_dict(result: Any) -> dict[str, Any]:
+    _materialize_side_files(result)
     return {
         "success": result.success,
         "cancelled": result.cancelled,
