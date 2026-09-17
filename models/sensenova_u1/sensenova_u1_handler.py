@@ -76,6 +76,7 @@ class family_handler:
     def query_model_def(base_model_type, model_def):
         return {
             "image_outputs": True,
+            "dtype": "bf16",
             "no_negative_prompt": True,
             "no_background_removal": True,
             "guidance_max_phases": 1,
@@ -103,9 +104,9 @@ class family_handler:
                 "selection": ["T", "TI", "T1", "TI1"],
                 "labels": {
                     "T": "A General Image Prompt using existing Text Prompt",
-                    "TI": "A General Image Prompt using existing Text Prompt and First Reference Image",
+                    "TI": "A General Image Prompt using existing Text Prompt and {image_inputs}",
                     "T1": "An Infographic Prompt using existing Text Prompt",
-                    "TI1": "An Infographic Prompt using existing Text Prompt and First Reference Image",
+                    "TI1": "An Infographic Prompt using existing Text Prompt and {image_inputs}",
                 },
                 "default": "",
             },

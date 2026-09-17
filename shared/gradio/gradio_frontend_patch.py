@@ -104,7 +104,67 @@ function Mn(S){
 }
 """
 
+# Keep native controls and letterboxing stable while a new gallery video loads.
+# Replace the poster on the first presented frame, rather than removing it at
+# loadeddata (which can precede painting and leave Chrome's paused player blank).
+_GALLERY_VIDEO_SOURCE = """
+const wangpGalleryFrames = new WeakMap();
+function wangpGalleryVideoPoster(video) {
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext("2d").drawImage(video, 0, 0);
+    return canvas.toDataURL("image/jpeg", 0.95);
+}
+function wangpGalleryVideoClear(video) {
+    const state = wangpGalleryFrames.get(video);
+    if (state?.request != null) video.cancelVideoFrameCallback(state.request);
+    if (state) video.removeEventListener("loadeddata", state.ready);
+    wangpGalleryFrames.delete(video);
+    video.removeEventListener("error", wangpGalleryVideoError);
+}
+function wangpGalleryVideoError(event) {
+    wangpGalleryVideoClear(event.currentTarget);
+    event.currentTarget.removeAttribute("poster");
+}
+function wangpGalleryVideoSource(video, src) {
+    if (video.dataset.testid !== "detailed-video" || !video.closest(".gallery-container")) {
+        j(video, "src", src);
+        return;
+    }
+    wangpGalleryVideoClear(video);
+    if (video.readyState >= 2 && video.videoWidth && video.videoHeight) video.poster = wangpGalleryVideoPoster(video);
+    j(video, "src", src);
+    const requestedSrc = video.src;
+    const state = {request: null, presented: false, ready() {
+        if (!state.presented || video.readyState < 2 || video.currentSrc !== requestedSrc) return;
+        wangpGalleryVideoClear(video);
+        video.poster = wangpGalleryVideoPoster(video);
+    }};
+    function presented() {
+        state.request = null;
+        // A playing source may still have an old frame awaiting composition.
+        if (video.currentSrc !== requestedSrc) {
+            state.request = video.requestVideoFrameCallback(presented);
+            return;
+        }
+        state.presented = true;
+        state.ready();
+    }
+    // These signals can arrive in either order, even while the video is paused.
+    wangpGalleryFrames.set(video, state);
+    video.addEventListener("loadeddata", state.ready);
+    video.addEventListener("error", wangpGalleryVideoError);
+    state.request = video.requestVideoFrameCallback(presented);
+}
+"""
+
 _PATCHES = {
+    'Video-C-llMUaJ.js': [
+        ('function ki(t){', _GALLERY_VIDEO_SOURCE + 'function ki(t){'),
+        ('&&j(e,"src",p),(!s||c&16)', '&&wangpGalleryVideoSource(e,p),(!s||c&16)'),
+        ('d(l){l&&(A(i),A(a),A(e))', 'd(l){wangpGalleryVideoClear(e);l&&(A(i),A(a),A(e))'),
+    ],
     'utils-BsGrhMNe.js': [
         # Round once before splitting units so 119.999 seconds displays as 2:00.
         ('const w=t=>{const o=Math.floor(t/3600)', 'const w=t=>{t=Math.round(t);const o=Math.floor(t/3600)'),
@@ -119,7 +179,11 @@ _PATCHES = {
     'Gallery-D7vc32lN.js': [
         # Selection is a user event. Server values/indices notify change once,
         # after normalization; index-only updates must still refresh consumers.
-        ('let ne=m;function se(s){', 'let ne=m,wangpGalleryUser=false,wangpGalleryExplicit=false,wangpGalleryChanged=false;function se(s){wangpGalleryUser=true;'),
+        ('let ne=m;function se(s){', 'let ne=m,wangpGalleryUser=false,wangpGalleryExplicit=false,wangpGalleryChanged=false;function se(s){'),
+        # Preview clicks zoom the current image; thumbnails/arrow keys select.
+        ('function se(s){const S=s.target,H=s.offsetX,X=S.offsetWidth/2;H<X?l(1,m=t):l(1,m=o)}', 'function se(s){(document.fullscreenElement?document.exitFullscreen():V.requestFullscreen()).catch(console.error)}'),
+        # Restoring or selecting a thumbnail must not scroll the whole page.
+        ('W[s]?.focus();', 'W[s]?.focus({preventScroll:true});'),
         ('function Re(s){switch(s.code){', 'function Re(s){if(["Escape","ArrowLeft","ArrowRight"].includes(s.code))wangpGalleryUser=true;switch(s.code){'),
         ('const qe=s=>l(1,m=s);', 'const qe=s=>{wangpGalleryUser=true;return l(1,m=s)};'),
         ('Oe=s=>{m===null', 'Oe=s=>{wangpGalleryUser=true;m===null'),
@@ -186,9 +250,11 @@ def _asset(path):
 _BOOT_SCRIPT = re.compile(r'<script type="module" crossorigin src="(?P<base>\./assets/)(?P<name>index-[^"]+\.js)"></script>')
 
 
-def _ui_signature(config, versions):
+def _ui_signature(config):
     # Initial values/choices, visibility and styling can change without changing
     # the wire contract. Hash only at app construction, never per page/request.
+    # Asset hashes version browser imports separately; a display-only patch does
+    # not invalidate an existing page's component IDs or event bindings.
     # ImageEditor.type converts decoded images to PIL/numpy/filepaths in Python;
     # the browser always exchanges the same EditorData structure.
     components = [
@@ -197,7 +263,7 @@ def _ui_signature(config, versions):
           if key in component['props'] and not (key == 'type' and component['type'] in ('imageeditor', 'wangpimageeditor'))}]
         for component in config['components']
     ]
-    contract = [config['version'], config['protocol'], config['api_prefix'], components, config['layout'], config['dependencies'], versions]
+    contract = [config['version'], config['protocol'], config['api_prefix'], components, config['layout'], config['dependencies']]
     return 'ui-' + sha256(json.dumps(contract, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
@@ -275,7 +341,7 @@ def install():
         # Blocks.__init__ creates a provisional app before the UI exists.
         if hasattr(blocks, 'config'):
             config = blocks.config
-            config['wangp_ui_signature'] = _ui_signature(config, versions)
+            config['wangp_ui_signature'] = _ui_signature(config)
             app.add_middleware(_BrowserInstanceGuard, signature=config['wangp_ui_signature'])
         return app
 

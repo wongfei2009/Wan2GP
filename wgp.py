@@ -114,6 +114,9 @@ import typing
 import inspect
 from shared.utils import prompt_parser
 from shared.prompt_enhancer import chaining as prompt_enhancer_chaining
+from shared.prompt_enhancer import images as prompt_enhancer_images
+from shared.prompt_enhancer import labels as prompt_enhancer_labels
+from shared.prompt_enhancer.progress import EnhancementProgress
 from shared.prompt_enhancer.config import PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT, PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, normalize_prompt_enhancer_speculative_decoding
 import base64
 import io
@@ -166,7 +169,7 @@ AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 target_mmgp_version = "3.8.0"
-WanGP_version = "13.02"
+WanGP_version = "13.10"
 settings_version = 2.79
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
@@ -1174,7 +1177,7 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
     model_mode = inputs["model_mode"]
     if image_mode == 0 and model_def.get("image_outputs", False): image_mode = 1
     medium = "Videos" if image_mode == 0 else "Images"
-    prompt_enhancer_choices, prompt_enhancer_default, prompt_enhancer_def = get_prompt_enhancer_choices(model_def, model_def.get("audio_only", False), image_mode, include_disabled=True)
+    prompt_enhancer_choices, prompt_enhancer_default, prompt_enhancer_def = get_prompt_enhancer_choices(model_def, model_def.get("audio_only", False), image_mode, include_disabled=True, video_prompt_type=inputs["video_prompt_type"], inputs=inputs)
     prompt_enhancer_values = [value for _, value in prompt_enhancer_choices]
     prompt_enhancer_mode = prompt_enhancer_chaining.normalize_choice(str(inputs.get("prompt_enhancer") or ""), prompt_enhancer_values, prompt_enhancer_default)
     inputs["prompt_enhancer"] = build_prompt_enhancer_value(prompt_enhancer_mode, "K" in str(inputs.get("prompt_enhancer") or "") and len(prompt_enhancer_mode) > 0)
@@ -4485,22 +4488,23 @@ def abort_generation(state, client_id="", notify = True):
 def early_stop_generation(state):
     gen = get_gen_info(state)
     gen["resume"] = True
-    if "in_progress" in gen:
-        queue = gen.get("queue", [])
-        model_type = queue[0].get("params", {}).get("model_type") if queue else None
-        model_def = get_model_def(model_type) if model_type else None
-        if not model_def or not model_def.get("supports_early_stop", False):
-            gr.Info("Early Stop is not supported for this model.")
-            return gr.Button(interactive=True)
+    queue = gen.get("queue", [])
+    if not queue:
+        return gr.Button(interactive=True)
+    model_type = queue[0].get("params", {}).get("model_type")
+    model_def = get_model_def(model_type) if model_type else None
+    if not model_def or not model_def.get("supports_early_stop", False):
+        gr.Info("Early Stop is not supported for this model.")
+        return gr.Button(interactive=True)
+    with gen_lock:
         if gen.get("early_stop", False):
             return gr.Button(interactive=False)
         gen["early_stop"] = True
         gen["early_stop_forwarded"] = False
-        msg = "Early Stop in progress"
-        gen["status"] = msg
-        gr.Info(msg)
-        return gr.Button(interactive=False)
-    return gr.Button(interactive=True)
+    msg = "Early Stop Requested"
+    gen["status"] = msg
+    gr.Info(msg)
+    return gr.Button(interactive=False)
 
 def gallery_update(file_list, selected_index, **kwargs):
     visible, local_index, _ = gallery_window(file_list, selected_index, server_config['clear_file_list'])
@@ -4514,6 +4518,15 @@ def pack_audio_gallery_state(audio_file_list, selected_index, refresh = True):
 def unpack_audio_list(packed_audio_file_list):
     value = json.loads(packed_audio_file_list)
     return value['paths'] if isinstance(value, dict) else value
+
+def can_extend_sample(params):
+    if _is_edit_task_params(params) or params.get("mode") == "edit" or params.get("image_mode", 0) != 0:
+        return False
+    model_type = params["model_type"]
+    base_model_type, model_def = get_base_model_type(model_type), get_model_def(model_type)
+    preprocess_all = resolve_model_preprocess_all(model_def, base_model_type=base_model_type, video_prompt_type=params.get("video_prompt_type", ""), image_prompt_type=params.get("image_prompt_type", ""), audio_prompt_type=params.get("audio_prompt_type", ""), custom_settings=params.get("custom_settings", {}), params=params)
+    return test_any_sliding_window(base_model_type) and not preprocess_all
+
 
 def refresh_gallery(state): #, msg
     service = service_for(state)
@@ -4556,7 +4569,7 @@ def refresh_gallery(state): #, msg
         last_was_audio = False  # Synchronize the visual selection even while displaying audio.
 
     if not in_progress or len(queue) == 0:
-        return *output_tabs, gallery_update(file_list, choice), gr.update() if last_was_audio else choice, *pack_audio_gallery_state(audio_file_list, audio_choice), gr.HTML("", visible= False),  gr.Button(visible=True), gr.Button(visible=False), gr.Row(visible=False), gr.Row(visible=False), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(interactive=  early_stop_interactive, visible= early_stop_visible), gr.Button(visible= False)
+        return *output_tabs, gallery_update(file_list, choice), gr.update() if last_was_audio else choice, *pack_audio_gallery_state(audio_file_list, audio_choice), gr.HTML("", visible= False),  gr.Button(visible=True), gr.Button(visible=False), gr.Row(visible=False), gr.update(), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(interactive=  early_stop_interactive, visible= early_stop_visible), gr.Button(visible= False), gr.update(visible=False)
     else:
         task = queue[0]
         prompt =  task["prompt"]
@@ -4565,11 +4578,10 @@ def refresh_gallery(state): #, msg
         is_edit_task = _is_edit_task_params(params)
         multi_prompts_gen_type = "FG" if is_edit_task else params["multi_prompts_gen_type"]
         if is_edit_task:
-            base_model_type, model_def, preprocess_all = None, None, False
+            base_model_type, model_def = None, None
         else:
             base_model_type, model_def = get_base_model_type(model_type), get_model_def(model_type)
-            preprocess_all = resolve_model_preprocess_all(model_def, base_model_type=base_model_type, video_prompt_type=params.get("video_prompt_type", ""), image_prompt_type=params.get("image_prompt_type", ""), audio_prompt_type=params.get("audio_prompt_type", ""), custom_settings=params.get("custom_settings", {}), params=params)
-        onemorewindow_visible = model_def is not None and test_any_sliding_window(base_model_type) and params.get("image_mode",0) == 0 and not preprocess_all
+        onemorewindow_visible = can_extend_sample(params)
         early_stop_visible = bool(model_def and model_def.get("supports_early_stop", False))
         enhanced = False
         if prompt.startswith(prompt_parser.ENHANCED_PROMPT_PREFIX):
@@ -4591,7 +4603,7 @@ def refresh_gallery(state): #, msg
                 escaped_prompts.append(escaped_prompt)
             prompt = "<BR><DIV style='height:8px'></DIV>".join(escaped_prompts)
         if is_edit_task:
-            summary, prompt = prompt, ""
+            summary, prompt = task["prompt"], ""
         else:
             is_image = params["image_mode"] > 0
             audio_only = model_def.get("audio_only", False)
@@ -4610,7 +4622,6 @@ def refresh_gallery(state): #, msg
                     fps = get_computed_fps(params["force_fps"], base_model_type, params.get("video_guide"), params.get("video_source"))
                     summary += f", {frames} frames ({round(frames / fps, 1):g}s)"
                 summary += f", {params['resolution']}, {params['num_inference_steps']} inference steps"
-            summary = html.escape(summary)
 
         details = f'<div class="generation-note">{html.escape(header_text)}</div>' if header_text else ""
         if prompt:
@@ -4626,16 +4637,14 @@ def refresh_gallery(state): #, msg
         if thumbnails:
             thumbnails = f'<td><div class="generation-references" role="group" aria-label="Generation References">{thumbnails}</div></td>'
         table = f'<div class="generation-table-wrap"><table id="PINFO"><tbody><tr><td class="generation-prompt-cell">{details}</td>{thumbnails}</tr></tbody></table></div>' if details or thumbnails else ""
-        if params.get("mode", None) in ['edit'] : onemorewindow_visible = False
-        gen_buttons_visible = True
-        html_content = f'<div class="wangp-generation-info"><div class="generation-summary"><strong>{summary}</strong></div>{table}</div>'
+        html_content = f'<div class="wangp-generation-info">{table}</div>'
         html_output = gr.HTML(html_content, visible= True)
         if last_was_audio:
             audio_choice = max(-1, audio_choice)
         else:
             choice = max(0, choice)
                     
-        return *output_tabs, gallery_update(file_list, choice), gr.update() if last_was_audio else choice, *pack_audio_gallery_state(audio_file_list, audio_choice), html_output, gr.Button(visible=False), gr.Button(visible=True), gr.Row(visible=True), gr.Row(visible= gen_buttons_visible), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(interactive=  early_stop_interactive, visible= early_stop_visible), gr.Button(visible= onemorewindow_visible)
+        return *output_tabs, gallery_update(file_list, choice), gr.update() if last_was_audio else choice, *pack_audio_gallery_state(audio_file_list, audio_choice), html_output, gr.Button(visible=False), gr.Button(visible=True), gr.Row(visible=True), gr.update(), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(interactive=  early_stop_interactive, visible= early_stop_visible), gr.Button(visible= onemorewindow_visible), gr.update(label=summary, visible=True)
 
 
 
@@ -6194,8 +6203,9 @@ def edit_media(
     any_change_initial = any_change
     while not gen.get("abort", False): 
         any_change = any_change_initial
-        extra_generation += gen.get("extra_orders",0)
-        gen["extra_orders"] = 0
+        with gen_lock:
+            extra_generation += gen.get("extra_orders",0)
+            gen["extra_orders"] = 0
         total_generation = repeat_generation + extra_generation
         gen["total_generation"] = total_generation         
         if repeat_no >= total_generation: break
@@ -6440,6 +6450,7 @@ class DynamicClass:
 def process_prompt_enhancer(model_type, model_def, prompt_enhancer, original_prompts,  image_start, original_image_refs, is_image, audio_only, seed, prompt_enhancer_instructions = None, text_encoder_max_tokens = 512, enhancer_kwargs = None, batch_images = False):
     global enhancer_offloadobj
     prompt_enhancer_mode = str(prompt_enhancer or "")
+    original_prompts, window_commands = prompt_enhancer_images.strip_window_commands(original_prompts)
     prompt_enhancer_instructions, text_encoder_max_tokens = resolve_prompt_enhancer_settings(
         model_type,
         model_def,
@@ -6457,17 +6468,17 @@ def process_prompt_enhancer(model_type, model_def, prompt_enhancer, original_pro
         prompt_enhancer_instructions = f"{prompt_enhancer_instructions}\n\n{TRANSCRIPT_INSTRUCTIONS}"
 
     from shared.prompt_enhancer.prompt_enhance_utils import generate_cinematic_prompt
-    prompt_images = []
-    if "I" in prompt_enhancer_mode:
-        if image_start != None:
-            if not isinstance(image_start, list): image_start= [image_start] 
-            prompt_images += image_start if batch_images else image_start[:1]
-        if original_image_refs != None and (not batch_images or len(prompt_images) == 0):
-            prompt_images += original_image_refs[:1]
-    prompt_images = [img for img in prompt_images if img is not None]
+    image_contexts = (enhancer_kwargs or {}).get("image_contexts") if prompt_enhancer_images.enabled(server_config, prompt_enhancer_mode) else None
+    if image_contexts is not None:
+        image_contexts = prompt_enhancer_images.contexts_for_prompts(image_contexts, len(original_prompts))
+    duration_contexts = (enhancer_kwargs or {}).get("image_contexts")
+    prompt_durations = [context.duration_seconds for context in prompt_enhancer_images.contexts_for_prompts(duration_contexts, len(original_prompts))] if duration_contexts is not None else None
+    if image_start is None:
+        image_start = (enhancer_kwargs or {}).get("control_image")
+    prompt_images, image_contexts = prompt_enhancer_images.select_images(prompt_enhancer_mode, image_start, original_image_refs, batch_images, image_contexts)
     prompt_images = [_open_image_input(img) if isinstance(img, str) else img for img in prompt_images]
     video_duration = (enhancer_kwargs or {}).get("video_duration_seconds")
-    if model_def.get("prompt_enhancer_video_duration", False) and not is_image and not audio_only and video_duration is not None:
+    if prompt_durations is None and model_def.get("prompt_enhancer_video_duration", False) and not is_image and not audio_only and video_duration is not None:
         if prompt_enhancer_instructions is None:
             from shared.prompt_enhancer.prompt_enhance_utils import T2V_CINEMATIC_PROMPT, IT2V_CINEMATIC_PROMPT
             prompt_enhancer_instructions = IT2V_CINEMATIC_PROMPT if prompt_images else T2V_CINEMATIC_PROMPT
@@ -6481,32 +6492,32 @@ def process_prompt_enhancer(model_type, model_def, prompt_enhancer, original_pro
         if is_remote_engine(remote_engine):
             from shared.remote_llm.prompt_enhancer import enhance_prompt as enhance_prompt_remote
 
-            return enhance_prompt_remote(
+            prompts = enhance_prompt_remote(
                 remote_engine,
                 server_config,
-                original_prompts if has_text_input else ["an image"],
+                original_prompts if has_text_input else ["an image"] * len(original_prompts),
                 prompt_images,
                 instructions=prompt_enhancer_instructions or "",
                 max_output_tokens=text_encoder_max_tokens,
+                prompt_durations=prompt_durations,
+                enhancement_progress=(enhancer_kwargs or {}).get("generation_callbacks", {}).get("enhancement_progress"),
             )
+            return prompt_enhancer_images.restore_window_commands(prompts, window_commands)
         import secrets
         enhancer_temperature = server_config.get("prompt_enhancer_temperature", 0.6)
         enhancer_top_p = server_config.get("prompt_enhancer_top_p", 0.9)
         randomize_seed = server_config.get("prompt_enhancer_randomize_seed", True)
+        prompt_enhancer_images.warn_florence_images(server_config, prompt_enhancer_mode, image_start, original_image_refs, batch_images, len(original_prompts), (enhancer_kwargs or {}).get("caption_input_info"))
         if randomize_seed:
             enhancer_seed = secrets.randbits(32)
         else:
             enhancer_seed = seed if seed is not None and seed >= 0 else 0
-        post_image_caption_hook = None
-        if len(prompt_images) > 0 and enhancer_offloadobj is not None:
-            if hasattr(prompt_enhancer_image_caption_model, "vision_tower_model") and hasattr(prompt_enhancer_llm_model, "generate_messages"):
-                post_image_caption_hook = enhancer_offloadobj.unload_all
         prompts = generate_cinematic_prompt(
             prompt_enhancer_image_caption_model,
             prompt_enhancer_image_caption_processor,
             prompt_enhancer_llm_model,
             prompt_enhancer_llm_tokenizer,
-            original_prompts if has_text_input else ["an image"],
+            original_prompts if has_text_input else ["an image"] * len(original_prompts),
             prompt_images if len(prompt_images) > 0 else None,
             video_prompt = not is_image,
             text_prompt = audio_only,
@@ -6516,11 +6527,13 @@ def process_prompt_enhancer(model_type, model_def, prompt_enhancer, original_pro
             temperature = enhancer_temperature,
             top_p = enhancer_top_p,
             seed = enhancer_seed,
-            post_image_caption_hook = post_image_caption_hook,
+            image_contexts=image_contexts,
+            offload_manager=enhancer_offloadobj,
+            prompt_durations=prompt_durations,
             thinking_enabled = "K" in prompt_enhancer_mode,
             generation_callbacks=(enhancer_kwargs or {}).get("generation_callbacks"),
         )
-        return prompts
+        return prompt_enhancer_images.restore_window_commands(prompts, window_commands)
 
 
 def resolve_prompt_enhancer_settings(model_type, model_def, prompt_enhancer_mode, is_image, prompt_enhancer_instructions = None, text_encoder_max_tokens = 512, enhancer_kwargs = None):
@@ -6614,13 +6627,14 @@ def exec_prompt_enhancer_engine(state, model_type, model_def, prompt_enhancer_mo
         return enhanced_result
 
     enhanced_prompts = []
-    for i, (one_prompt, one_image) in enumerate(zip(original_prompts, image_start)):
-        start_images = [one_image] if one_image is not None else None
-        status = f'Please Wait While Enhancing Prompt' if num_prompts==1 else f'Please Wait While Enhancing Prompt #{i+1}'
+    batch_windows = (enhancer_kwargs or {}).get("image_contexts") is not None and prompt_enhancer_images.enabled(server_config, prompt_enhancer_modes)
+    batches = [(original_prompts, image_start)] if batch_windows else [([one_prompt], [one_image] if one_image is not None else None) for one_prompt, one_image in zip(original_prompts, image_start)]
+    for i, (batch_prompts, start_images) in enumerate(batches):
+        status = 'Enhancing Prompt' + (f' {i+1}/{num_prompts}' if num_prompts > 1 else '')
         progress((i , num_prompts), desc=status, total= num_prompts)
 
         try:
-            enhanced_prompt = process_prompt_enhancer(model_type, model_def, prompt_enhancer_modes, [one_prompt],  start_images, original_image_refs, is_image, audio_only, seed, enhancer_kwargs = enhancer_kwargs)
+            enhanced_prompt = process_prompt_enhancer(model_type, model_def, prompt_enhancer_modes, batch_prompts, start_images, original_image_refs, is_image, audio_only, seed, enhancer_kwargs=prompt_enhancer_images.batch_kwargs(enhancer_kwargs, i, batch_windows, num_prompts))
         except Exception as e:
             if local_runtime:
                 unload_prompt_enhancer_runtime()
@@ -6630,7 +6644,7 @@ def exec_prompt_enhancer_engine(state, model_type, model_def, prompt_enhancer_mo
                 raise
             print(traceback.format_exc())
             raise gr.Error(e)
-        enhanced_prompts.append(enhanced_prompt)
+        enhanced_prompts.extend([[value] for value in enhanced_prompt] if batch_windows else [enhanced_prompt])
 
     if local_runtime:
         unload_prompt_enhancer_runtime()
@@ -6646,6 +6660,11 @@ def prompt_enhancer_outputs_multiple_prompts(prompt_enhancer_mode):
     return "M" in str(prompt_enhancer_mode or "")
 
 def normalize_generated_prompt_lines(prompt, multi_prompts_gen_type, multi_prompt_output=False):
+    texts, commands = prompt_enhancer_images.strip_window_commands([str(prompt or "")])
+    output = _normalize_generated_prompt_lines(texts[0], multi_prompts_gen_type, multi_prompt_output)
+    return prompt_enhancer_images.restore_window_commands([output], commands, multi_prompts_gen_type)[0]
+
+def _normalize_generated_prompt_lines(prompt, multi_prompts_gen_type, multi_prompt_output=False):
     prompt = str(prompt or "").replace("\r\n", "\n").replace("\r", "\n")
     if multi_prompt_output:
         prompt_lines = [line.strip() for line in prompt.split("\n") if line.strip()]
@@ -6691,8 +6710,24 @@ def enhance_prompt(state, prompt, alt_prompt, prompt_enhancer, multi_images_gen_
         return gr.update(), gr.update(), gr.update()
     image_prompt_type = inputs["image_prompt_type"]
     video_prompt_type = inputs["video_prompt_type"]
+    multi_image_enhancer = prompt_enhancer_images.enabled(server_config, prompt_enhancer)
+    image_contexts = None
     image_start = inputs["image_start"] if "S" in image_prompt_type else None
-    if image_start is None:
+    continuation_image = None
+    if inputs["image_mode"] == 0 and any_letters(image_prompt_type, "VL"):
+        inputs = dict(inputs, video_source=prompt_enhancer_images.resolve_continue_video(inputs["video_source"], image_prompt_type, get_processed_queue(get_gen_info(state))[0], save_path))
+        if "I" in prompt_enhancer and not image_start and inputs["video_source"] is not None:
+            progress(0, desc="Reading Continuation Start Image")
+            fps = get_computed_fps(inputs["force_fps"], get_base_model_type(model_type), inputs["video_guide"], inputs["video_source"])
+            continuation_image = prompt_enhancer_images.continuation_start_image(inputs["video_source"], inputs["keep_frames_video_source"], fps, max_source_video_frames)
+    if multi_image_enhancer or has_slash_commands(original_prompts) or continuation_image is not None:
+        fps = get_computed_fps(inputs["force_fps"], get_base_model_type(model_type), inputs["video_guide"], inputs["video_source"])
+        source_frames = estimate_first_window_overlap_frames(image_start, inputs["video_source"] if any_letters(image_prompt_type, "VL") else None, inputs["keep_frames_video_source"], fps)
+        original_prompts, image_contexts = prompt_enhancer_images.prepare_manual(original_prompts, inputs, model_def, fps=fps, source_frames=source_frames, open_image=convert_image, multi_prompt_output=multi_prompt_output, continuation_image=continuation_image)
+        num_prompts = len(original_prompts)
+        if multi_image_enhancer:
+            image_start = None
+    if image_start is None and not multi_image_enhancer:
         image_start = inputs["image_end"] if "E" in image_prompt_type else None
     if image_start is None or not "I" in prompt_enhancer:
         image_start = [None] * num_prompts
@@ -6711,6 +6746,8 @@ def enhance_prompt(state, prompt, alt_prompt, prompt_enhancer, multi_images_gen_
                 gr.Info("On Demand Prompt Enhancer supports only mutiple Start Images if their number matches the number of Text Prompts")
                 return gr.update(), gr.update(), gr.update()
 
+    if continuation_image is not None and not multi_image_enhancer:
+        image_start = [next((image for image, label in zip(context.images, context.labels) if label in ("start image", "end image")), None) for context in image_contexts]
     original_image_refs = inputs["image_refs"] if "I" in video_prompt_type else None
     if original_image_refs is not None:
         original_image_refs = [ convert_image(tup[0]) for tup in original_image_refs ]        
@@ -6720,11 +6757,15 @@ def enhance_prompt(state, prompt, alt_prompt, prompt_enhancer, multi_images_gen_
     model_def = get_model_def(get_state_model_type(state))
     audio_only = model_def.get("audio_only", False)
     enhancer_kwargs = {"image_prompt_type": image_prompt_type, "video_prompt_type": video_prompt_type, "audio_prompt_type": audio_prompt_type, "audio_guide": inputs["audio_guide"] if "A" in audio_prompt_type else None, "duration_seconds": inputs["duration_seconds"]}
+    enhancer_kwargs["control_image"] = prompt_enhancer_images.control_image_input(inputs)
+    enhancer_kwargs["caption_input_info"] = prompt_enhancer_images.caption_input_info((inputs["image_start"] if "S" in image_prompt_type else None) or continuation_image, inputs["image_end"] if "E" in image_prompt_type else None, original_image_refs, enhancer_kwargs["control_image"], "K" in video_prompt_type)
+    if image_contexts is not None:
+        enhancer_kwargs["image_contexts"] = image_contexts
     if model_def.get("prompt_enhancer_video_duration", False) and not is_image and not audio_only:
         frames = min(inputs["video_length"], inputs["sliding_window_size"]) if model_def.get("sliding_window", False) else inputs["video_length"]
         fps = get_computed_fps(inputs["force_fps"], get_base_model_type(model_type), inputs["video_guide"], inputs["video_source"])
         enhancer_kwargs["video_duration_seconds"] = frames / fps
-    enhancer_kwargs["generation_callbacks"] = {"stop_requested": lambda: progress.gen["abort"], "stream_callback": progress.stream_tokens}
+    enhancer_kwargs["generation_callbacks"] = {"stop_requested": lambda: progress.gen["abort"], "enhancement_progress": EnhancementProgress(progress, progress.stream_tokens)}
     enhanced = exec_prompt_enhancer_engine(state, model_type, model_def, prompt_enhancer, original_prompts, image_start, original_image_refs, is_image, audio_only, seed, progress, override_profile, enhancer_kwargs=enhancer_kwargs, alt_prompts=original_alt_prompts if routed else None, alt_prompt_inherits_prompt_paragraphs=alt_prompt_inherits)
 
     progress.check_cancelled()
@@ -6983,9 +7024,7 @@ def generate_media(
     api_options = plugin_data.get("api", {}) if isinstance(plugin_data, dict) and isinstance(plugin_data.get("api", {}), dict) else {}
     flashvsr_continue_cache = api_options.get("flashvsr_continue_cache")
     return_flashvsr_continue_cache = bool(api_options.get("return_flashvsr_continue_cache"))
-    gen["early_stop"] = False
     api_return_side_files = bool(api_options.get("return_side_files", api_return_video_uint8 or api_return_audio))
-    gen["early_stop_forwarded"] = False
     gen["last_progress_args"] = None
     torch.set_grad_enabled(False) 
     if mode == "edit_audio":
@@ -7277,12 +7316,7 @@ def generate_media(
     else:
         speakers_bboxes = None        
     if "L" in image_prompt_type:
-        file_list, _, _, _ = get_processed_queue(gen)
-        if len(file_list)>0:
-            video_source = file_list[-1]
-        else:
-            video_files = glob.glob(os.path.join(save_path, "*.mp4")) + glob.glob(os.path.join(save_path, "*.mov")) + glob.glob(os.path.join(save_path, "*.mkv"))
-            video_source = max(video_files, key=os.path.getmtime) if video_files else None
+        video_source = prompt_enhancer_images.resolve_continue_video(video_source, image_prompt_type, get_processed_queue(gen)[0], save_path)
     fps = 1 if is_image else get_computed_fps(force_fps, base_model_type , video_guide, video_source )
     gen_state = {}
     frame_scheduler = None
@@ -7529,8 +7563,9 @@ def generate_media(
     gen["sliding_window"] = sliding_window 
     while not abort: 
         stop_current_sample = False
-        extra_generation += gen.get("extra_orders",0)
-        gen["extra_orders"] = 0
+        with gen_lock:
+            extra_generation += gen.get("extra_orders",0)
+            gen["extra_orders"] = 0
         total_generation = repeat_generation + extra_generation
         gen["total_generation"] = total_generation     
         gen["header_text"] = ""    
@@ -7564,7 +7599,6 @@ def generate_media(
         image_size = default_image_size #  default frame dimensions for budget until it is change due to a resize
         sample_fit_canvas = fit_canvas
         current_video_length = first_window_video_length
-        gen["extra_windows"] = 0
         gen["total_windows"] = 1
         gen["window_no"] = 1
         input_waveform, input_waveform_sample_rate = None, 0
@@ -7578,6 +7612,8 @@ def generate_media(
         if auto_prompt_enhancer_requested:
             send_cmd("progress", [0, get_latest_status(state, "Enhancing Prompt")])
             enhancer_kwargs = {"image_prompt_type":  image_prompt_type, "video_prompt_type":  video_prompt_type, "audio_prompt_type":  audio_prompt_type}
+            enhancer_kwargs["control_image"] = video_guide if is_image and "V" in video_prompt_type else None
+            enhancer_kwargs["generation_callbacks"] = {"stop_requested": lambda: gen.get("abort", False), "enhancement_progress": EnhancementProgress(lambda value, desc, total, unit: send_cmd("progress", [value, get_latest_status(state, desc), total, unit]))}
             if model_def.get("prompt_enhancer_video_duration", False) and not is_image and not audio_only:
                 frames = min(video_length, sliding_window_size) if model_def.get("sliding_window", False) else video_length
                 enhancer_kwargs["video_duration_seconds"] = frames / fps
@@ -7585,6 +7621,13 @@ def generate_media(
             prompts_to_enhance = original_prompts[:1] if multi_prompt_output else original_prompts
             routed = prompt_enhancer_chaining.uses_routing(prompt_enhancer)
             try:
+                continuation_image = None
+                enhancer_windows = scheduled_windows if scheduler_active else default_windows
+                if "I" in prompt_enhancer and not is_image and not audio_only and image_start is None and video_source is not None and not enhancer_windows[0].get("new_shot", False):
+                    send_cmd("progress", [0, get_latest_status(state, "Reading Continuation Start Image")])
+                    continuation_image = prompt_enhancer_images.continuation_start_image(video_source, keep_frames_video_source, fps, max_source_video_frames)
+                enhancer_start = image_start if image_start is not None else continuation_image
+                enhancer_kwargs["caption_input_info"] = prompt_enhancer_images.caption_input_info(enhancer_start, image_end, original_image_refs, enhancer_kwargs["control_image"], "K" in video_prompt_type)
                 if "W" in prompt_enhancer:
                     from shared.prompt_enhancer.transcription import transcribe_source_audio
 
@@ -7593,10 +7636,13 @@ def generate_media(
                     if enhancer_kwargs["source_audio_transcript"] is None:
                         prompt_enhancer = prompt_enhancer.replace("W", "")
                 ensure_prompt_enhancer_loaded(override_profile=override_profile, send_cmd=send_cmd, gen=gen)
+                if prompt_enhancer_images.enabled(server_config, prompt_enhancer) or has_slash_commands(original_prompts):
+                    original_prompts, enhancer_kwargs["image_contexts"] = prompt_enhancer_images.prepare_auto(original_prompts, None if fake_start_image else image_start, image_end, original_image_refs, windows=scheduled_windows if scheduler_active else default_windows, fps=fps, window_size=sliding_window_size, positions=frames_positions, source_frames=first_window_available_overlap, reset_alignment=reset_control_aligment, model_def=model_def, discard_frames=sliding_window_discard_last_frames, reuse_frames=default_reuse_frames, multi_prompt_output=multi_prompt_output, video=not is_image and not audio_only, video_prompt_type=video_prompt_type, control_image=enhancer_kwargs["control_image"], continuation_image=continuation_image)
+                    prompts_to_enhance = original_prompts[:1] if multi_prompt_output else original_prompts
                 if routed:
-                    enhanced = prompt_enhancer_chaining.run_chain(prompt_enhancer, original_prompts, original_alt_prompts, alt_prompt_inherits, lambda step, values: process_prompt_enhancer(model_type, model_def, step.mode, values, image_start if image_start is not None else image_end, original_image_refs, is_image, audio_only, seed, enhancer_kwargs=enhancer_kwargs, batch_images=True))
+                    enhanced = prompt_enhancer_chaining.run_chain(prompt_enhancer, original_prompts, original_alt_prompts, alt_prompt_inherits, lambda step, values: process_prompt_enhancer(model_type, model_def, step.mode, values, enhancer_start if enhancer_start is not None else image_end, original_image_refs, is_image, audio_only, seed, enhancer_kwargs=enhancer_kwargs, batch_images=True))
                 else:
-                    enhanced = process_prompt_enhancer(model_type, model_def, prompt_enhancer, prompts_to_enhance, image_start if image_start is not None else image_end, original_image_refs, is_image, audio_only, seed, enhancer_kwargs=enhancer_kwargs)
+                    enhanced = process_prompt_enhancer(model_type, model_def, prompt_enhancer, prompts_to_enhance, enhancer_start if enhancer_start is not None else image_end, original_image_refs, is_image, audio_only, seed, enhancer_kwargs=enhancer_kwargs)
             finally:
                 unload_prompt_enhancer_runtime()
                 if enhancer_offloadobj is not None:
@@ -7628,14 +7674,15 @@ def generate_media(
                 send_cmd("output")
                 if scheduler_active:
                     for idx, window in enumerate(scheduled_windows):
-                        window["prompt"] = prompts[idx] if idx < len(prompts) else prompts[-1]
+                        window["prompt"] = prompt_enhancer_images.strip_window_commands([prompts[idx] if idx < len(prompts) else prompts[-1]])[0][0]
                     frame_scheduler["prompts"] = [window["prompt"] for window in scheduled_windows]
                 abort = gen.get("abort", False)
 
  
         while not abort and not stop_current_sample:
-            new_extra_windows = gen.get("extra_windows",0)
-            gen["extra_windows"] = 0
+            with gen_lock:
+                new_extra_windows = gen.get("extra_windows",0)
+                gen["extra_windows"] = 0
             extra_windows += new_extra_windows
             if scheduler_active:
                 for _ in range(new_extra_windows):
@@ -7765,26 +7812,7 @@ def generate_media(
                 audio_proj_split = get_window_audio_embeddings(audio_proj_full, audio_start_idx= aligned_window_start_frame + (source_video_overlap_frames_count if reset_control_aligment else 0 ), clip_length = current_video_length)
 
             if repeat_no == 1 and window_no == 1 and image_refs is not None and len(image_refs) > 0:
-                frames_positions_list = []
-                if frames_positions is not None and len(frames_positions)> 0:
-                    positions = frames_positions.replace(","," ").split(" ")
-                    cur_end_pos =  -1 + (source_video_frames_count - source_video_overlap_frames_count)
-                    last_frame_no = requested_frames_to_generate + source_video_frames_count - source_video_overlap_frames_count
-                    joker_used = False
-                    project_window_no = 1
-                    for pos in positions :
-                        if len(pos) > 0:
-                            if pos.upper() in ["L", "X"]:
-                                cur_end_pos += sliding_window_size if project_window_no > 1 else current_video_length 
-                                if cur_end_pos >= last_frame_no-1 and not joker_used:
-                                    joker_used = True
-                                    cur_end_pos = last_frame_no -1
-                                project_window_no += 1
-                                if pos.upper() == "L": frames_positions_list.append(cur_end_pos)
-                                cur_end_pos -= sliding_window_discard_last_frames + reuse_frames
-                            else:
-                                frames_positions_list.append(int(pos)-1 + alignment_shift)
-                    frames_positions_list = frames_positions_list[:len(image_refs)]
+                frames_positions_list = prompt_enhancer_images.resolve_injected_positions(frames_positions, len(image_refs), windows=scheduled_windows if scheduler_active else default_windows, source_frames=source_video_frames_count, source_overlap=source_video_overlap_frames_count, window_size=sliding_window_size, discard_frames=sliding_window_discard_last_frames, reuse_frames=default_reuse_frames, alignment_shift=alignment_shift)
                 nb_frames_positions = len(frames_positions_list) 
                 if nb_frames_positions > 0:
                     frames_to_inject = [None] * (max(frames_positions_list) + 1)
@@ -8656,9 +8684,14 @@ def generate_media(
 def prepare_generate_media(state):
 
     if state.get("validate_success",0) != 1:
-        return gr.Button(visible= True), gr.Button(visible= False), gr.Column(visible= False), gr.update(visible=False)
+        return gr.Button(visible= True), gr.Button(visible= False), gr.Column(visible= False), gr.Button(visible=False), gr.Button(visible=False)
     else:
-        return gr.Button(visible= False), gr.Button(visible= True), gr.Column(visible= True), gr.update(visible= False)
+        if not get_gen_info(state).get("in_progress", False):
+            clear_status(state)
+        params = get_gen_info(state)["queue"][0]["params"]
+        extend_visible = can_extend_sample(params)
+        early_stop_visible = not _is_edit_task_params(params) and bool(get_model_def(params["model_type"]).get("supports_early_stop", False))
+        return gr.Button(visible= False), gr.Button(visible= True), gr.Column(visible= True), gr.Button(visible=extend_visible), gr.Button(visible=early_stop_visible, interactive=True)
 
 
 def generate_preview(model_type, payload):
@@ -8783,6 +8816,7 @@ def _process_tasks(state):
                 with lock:
                     if len(queue) > 0:
                         task = queue[0]
+                        gen["api_active_queue_task"] = task
 
                 if task is None:
                     break
@@ -8818,21 +8852,23 @@ def _process_tasks(state):
                     send_cmd("error", str(e))
                     return
 
-                abort = gen.get("abort", False)
+                with lock:
+                    abort = gen.get("abort", False)
+                    if abort:
+                        record_queue_error(state, [task], "abort", abort=True)
+                        gen["abort"] = False
+                    gen.pop("api_active_queue_task", None)
+                    if success:
+                        queue[:] = [item for item in queue if item['id'] != task_id]
                 if abort:
                     notification_run.interrupt("Generation aborted by the user.", aborted=True)
-                    record_queue_error(state, queue[:1], "abort", abort=True)
-                    gen["abort"] = False
                     send_cmd("status", "Video Generation Aborted")
                     send_cmd("output", None)
 
-                gen["early_stop"] = False
-                gen["early_stop_forwarded"] = False
+                clear_status(state)
                 if not success:
                     notification_run.interrupt("Generation stopped before the queue completed.")
                     break
-                with lock:
-                    queue[:] = [item for item in queue if item['id'] != task_id]
                 notification_run.task_completed()
                 update_global_queue_ref(queue)
                 
@@ -8841,6 +8877,8 @@ def _process_tasks(state):
             notification_run.fail(str(e))
             send_cmd("error", f"Queue worker crashed: {e}")
         finally:
+            with lock:
+                gen.pop("api_active_queue_task", None)
             send_cmd("worker_exit", None)
 
     async_run_in("generation", queue_worker_func)
@@ -9173,10 +9211,13 @@ def merge_status_context(status="", context=""):
         
 def clear_status(state):
     gen = get_gen_info(state)
-    gen["extra_windows"] = 0
+    with gen_lock:
+        gen["extra_windows"] = 0
+        gen["extra_orders"] = 0
+        gen["early_stop"] = False
+        gen["early_stop_forwarded"] = False
     gen["total_windows"] = 1
     gen["window_no"] = 1
-    gen["extra_orders"] = 0
     gen["repeat_no"] = 0
     gen["total_generation"] = 0
 
@@ -9201,9 +9242,9 @@ def update_status(state):
 
 def one_more_sample(state):
     gen = get_gen_info(state)
-    extra_orders = gen.get("extra_orders", 0)
-    extra_orders += 1
-    gen["extra_orders"]  = extra_orders
+    with gen_lock:
+        extra_orders = gen.get("extra_orders", 0) + 1
+        gen["extra_orders"] = extra_orders
     in_progress = gen.get("in_progress", False)
     if not in_progress :
         return state
@@ -9216,9 +9257,9 @@ def one_more_sample(state):
 
 def one_more_window(state):
     gen = get_gen_info(state)
-    extra_windows = gen.get("extra_windows", 0)
-    extra_windows += 1
-    gen["extra_windows"]= extra_windows
+    with gen_lock:
+        extra_windows = gen.get("extra_windows", 0) + 1
+        gen["extra_windows"] = extra_windows
     in_progress = gen.get("in_progress", False)
     if not in_progress :
         return state
@@ -10912,14 +10953,11 @@ def get_prompt_enhancer_letters_filter(prompt_enhancer_def, prompt_enhancer_choi
         letters_filter = add_to_sequence(letters_filter, str(value or ""))
     return letters_filter
 
-def get_prompt_enhancer_choices(model_def, audio_only=False, image_mode=0, include_disabled=True):
+def get_prompt_enhancer_choices(model_def, audio_only=False, image_mode=0, include_disabled=True, video_prompt_type=None, inputs=None):
     choices = [("Disabled", "")] if include_disabled else []
     prompt_enhancer_default = ""
-    default_labels = {
-        "T": "Based on Text Prompt Content",
-        "TI": "Based on both Text Prompt and Images Prompts Content (Start Image / First Reference Image)",
-    }
-    prompt_enhancer_def = model_def.get("prompt_enhancer_def")
+    default_labels = prompt_enhancer_labels.default_labels(model_def, image_mode, video_prompt_type, inputs)
+    prompt_enhancer_def = prompt_enhancer_labels.resolve_definition(model_def, image_mode, video_prompt_type, inputs)
     if prompt_enhancer_def is not None:
         labels = prompt_enhancer_def["labels"]
         prompt_enhancer_default = prompt_enhancer_def["default"]
@@ -10929,6 +10967,13 @@ def get_prompt_enhancer_choices(model_def, audio_only=False, image_mode=0, inclu
         selection = model_def.get("prompt_enhancer_choices_allowed", ["T"] if audio_only else ["T", "TI"])
         choices += [(default_labels.get(selection_value, selection_value), selection_value) for selection_value in selection]
     return choices, prompt_enhancer_default, prompt_enhancer_def
+
+
+def refresh_prompt_enhancer_labels(state, *values):
+    inputs = dict(zip(prompt_enhancer_labels.INPUT_KEYS, values))
+    model_def = get_model_def(get_state_model_type(state))
+    choices, _, _ = get_prompt_enhancer_choices(model_def, model_def.get("audio_only", False), inputs["image_mode"], include_disabled=server_config.get("enhancer_mode", 0) != 1, video_prompt_type=inputs["video_prompt_type"], inputs=inputs)
+    return gr.update(choices=choices)
 
 def build_prompt_enhancer_value(prompt_enhancer_mode, prompt_enhancer_think):
     return prompt_enhancer_chaining.with_thinking(prompt_enhancer_mode, prompt_enhancer_think)
@@ -11154,13 +11199,14 @@ def refresh_video_prompt_type_video_custom_checkbox(state, video_prompt_type, vi
 
 def refresh_preview(state):
     gen = get_gen_info(state)
+    placeholder = '<div style="text-align: center; color: var(--body-text-color-subdued); padding: 16px 0;">Preview not yet Available</div>'
     preview_image = gen.get("preview", None)
     if preview_image is None:
-        return ""
+        return placeholder
     
     preview_base64 = pil_to_base64_uri(preview_image, format="jpeg", quality=85)
     if preview_base64 is None:
-        return ""
+        return placeholder
 
     html_content = f"""
     <div style="display: flex; justify-content: center; align-items: center; height: 200px; cursor: pointer;" onclick="showImageModal('preview_0')">
@@ -11175,9 +11221,9 @@ def init_process_queue_if_any(state):
     gen = get_gen_info(state)
     if bool(gen.get("queue",[])):
         state["validate_success"] = 1
-        return gr.Button(visible=False), gr.Button(visible=True), gr.Column(visible=True)                   
+        return prepare_generate_media(state)
     else:
-        return gr.Button(visible=True), gr.Button(visible=False), gr.Column(visible=False)
+        return gr.Button(visible=True), gr.Button(visible=False), gr.Column(visible=False), gr.Button(visible=False), gr.Button(visible=False)
 
 def get_modal_image(image_base64, label):
     return f"""
@@ -12175,7 +12221,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 wizard_prompt_activated_var = gr.Text(wizard_prompt_activated, visible= False)
                 wizard_variables_var = gr.Text(wizard_variables, visible = False)
             on_demand_prompt_enhancer = server_config.get("enhancer_mode", 0) == 1
-            prompt_enhancer_choices, prompt_enhancer_default, prompt_enhancer_def = get_prompt_enhancer_choices(model_def, audio_only, image_mode_value, include_disabled=not on_demand_prompt_enhancer)
+            prompt_enhancer_choices, prompt_enhancer_default, prompt_enhancer_def = get_prompt_enhancer_choices(model_def, audio_only, image_mode_value, include_disabled=not on_demand_prompt_enhancer, video_prompt_type=video_prompt_type_value, inputs={**ui_defaults, "image_prompt_type": image_prompt_type_value})
             with gr.Row(visible=server_config.get("enhancer_enabled", 0) > 0 and any(value for _, value in prompt_enhancer_choices)) as prompt_enhancer_row:
                 prompt_enhancer_value = str(ui_get("prompt_enhancer") or "")
                 prompt_enhancer_btn_label = str(model_def.get("prompt_enhancer_button_label", "Enhance Prompt"))
@@ -12967,23 +13013,24 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
  
             if not update_form:
                 generate_btn = gr.Button("Generate")
-                add_to_queue_btn = gr.Button("Add New Prompt To Queue", visible=False)
                 generate_trigger = gr.Text(visible = False) 
                 add_to_queue_trigger = gr.Text(visible = False)
                 js_trigger_index = gr.Text(visible=False, elem_id="js_trigger_for_edit_refresh")
 
                 with gr.Column(visible= False) as current_gen_column:
-                    with gr.Accordion("Preview", open=False):
-                        preview = gr.HTML(label="Preview", show_label= False)
-                        preview_trigger = gr.Text(visible= False)
-                    gen_info = gr.HTML(visible=False, min_height=1) 
                     with gr.Row() as current_gen_buttons_row:
                         onemoresample_btn = gr.Button("One More Sample", visible = True, size='md', min_width=1)
                         onemorewindow_btn = gr.Button("Extend this Sample", visible = False, size='md', min_width=1)
                         pause_btn = gr.Button("Pause", visible = True, size='md', min_width=1)
                         resume_btn = gr.Button("Resume", visible = False, size='md', min_width=1)
                         abort_btn = gr.Button("Abort", visible = True, size='md', min_width=1)
-                        earlystop_btn = gr.Button("Early Stop", visible = True, size='md', min_width=1)
+                        earlystop_btn = gr.Button("Early Stop", visible = False, size='md', min_width=1)
+                    with gr.Accordion("Preview", open=False):
+                        preview = gr.HTML(value=refresh_preview(state_dict), label="Preview", show_label= False)
+                        preview_trigger = gr.Text(visible= False)
+                    with gr.Accordion("Current Prompt and Media", open=True, visible=False) as gen_info_accordion:
+                        gen_info = gr.HTML(visible=False, min_height=1)
+                add_to_queue_btn = gr.Button("Add New Prompt To Queue", visible=False)
                 with gr.Accordion("Queue Management", open=False) as queue_accordion:
                     with gr.Row():
                         queue_html = gr.HTML(
@@ -13058,6 +13105,8 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             image_prompt_type_radio.change(fn=refresh_image_prompt_type_radio, inputs=[state, image_prompt_type, image_prompt_type_radio, video_prompt_type], outputs=[image_prompt_type, image_start_row, image_end_row, video_source, input_video_strength, keep_frames_video_source, image_prompt_type_endcheckbox], show_progress="hidden" ) 
             image_prompt_type_endcheckbox.change(fn=refresh_image_prompt_type_endcheckbox, inputs=[state, image_prompt_type, image_prompt_type_radio, image_prompt_type_endcheckbox, video_prompt_type], outputs=[image_prompt_type, image_end_row, input_video_strength] ) 
             video_prompt_type_image_refs.input(fn=refresh_video_prompt_type_image_refs, inputs = [state, video_prompt_type, video_prompt_type_image_refs,image_mode, image_prompt_type], outputs = [video_prompt_type, image_refs_row, remove_background_images_ref,  image_refs_relative_size, frames_positions,video_guide_outpainting_col, input_video_strength, custom_settings_visibility_trigger], show_progress="hidden")
+            enhancer_label_inputs = [image_mode, video_prompt_type, image_prompt_type, image_start, image_end, image_refs, image_guide, image_mask_guide, video_source]
+            gr.on(triggers=[component.change for component in enhancer_label_inputs], fn=refresh_prompt_enhancer_labels, inputs=[state, *enhancer_label_inputs], outputs=[prompt_enhancer_mode_dropdown], show_progress="hidden", queue=False)
             video_prompt_type_video_guide.input(fn=refresh_video_prompt_type_video_guide,     inputs = [state, gr.State(""),   video_prompt_type, video_prompt_type_video_guide,     image_mode, image_mask_guide, image_guide, image_mask, image_prompt_type, audio_prompt_type], outputs = [video_prompt_type, video_guide, video_guide2, image_guide, keep_frames_video_guide, denoising_strength, masking_strength, video_guide_outpainting_col, video_prompt_type_video_mask, video_mask, image_mask, image_mask_guide, mask_expand, image_refs_row, remove_background_images_ref, frames_positions, video_prompt_type_video_custom_dropbox, video_prompt_type_video_custom_checkbox, input_video_strength, magic_mask_image_btn, magic_mask_video_btn, force_control_video_trim, custom_settings_visibility_trigger], show_progress="hidden", queue=False)
             video_prompt_type_video_guide_alt.input(fn=refresh_video_prompt_type_video_guide, inputs = [state, gr.State("alt"),video_prompt_type, video_prompt_type_video_guide_alt, image_mode, image_mask_guide, image_guide, image_mask, image_prompt_type, audio_prompt_type], outputs = [video_prompt_type, video_guide, video_guide2, image_guide, keep_frames_video_guide, denoising_strength, masking_strength, video_guide_outpainting_col, video_prompt_type_video_mask, video_mask, image_mask, image_mask_guide, mask_expand, image_refs_row, remove_background_images_ref, frames_positions, video_prompt_type_video_custom_dropbox, video_prompt_type_video_custom_checkbox, input_video_strength, magic_mask_image_btn, magic_mask_video_btn, force_control_video_trim, custom_settings_visibility_trigger], show_progress="hidden", queue=False)
             custom_settings_visibility_trigger.change(fn=refresh_custom_settings_visibility, inputs=[state, video_prompt_type, audio_prompt_type], outputs=custom_settings_rows + custom_setting_extra_inputs, show_progress="hidden")
@@ -13128,10 +13177,10 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
 
             if tab_id == 'generate':
                 from shared.deepy.hybrid_ui import bind_gallery_sync
-                bind_gallery_sync(_deepy_hybrid, state, refresh_gallery, [gallery_tabs, current_gallery_tab, output, last_choice, audio_files_paths, audio_file_selected, audio_gallery_refresh_trigger, gen_info, generate_btn, add_to_queue_btn, current_gen_column, current_gen_buttons_row, queue_html, abort_btn, earlystop_btn, onemorewindow_btn], gallery=output, main=main)
+                bind_gallery_sync(_deepy_hybrid, state, refresh_gallery, [gallery_tabs, current_gallery_tab, output, last_choice, audio_files_paths, audio_file_selected, audio_gallery_refresh_trigger, gen_info, generate_btn, add_to_queue_btn, current_gen_column, current_gen_buttons_row, queue_html, abort_btn, earlystop_btn, onemorewindow_btn, gen_info_accordion], gallery=output, main=main)
                 output_trigger.change(refresh_gallery,
                     inputs = [state], 
-                    outputs = [gallery_tabs, current_gallery_tab, output, last_choice, audio_files_paths, audio_file_selected, audio_gallery_refresh_trigger, gen_info, generate_btn, add_to_queue_btn, current_gen_column, current_gen_buttons_row, queue_html, abort_btn, earlystop_btn, onemorewindow_btn],
+                    outputs = [gallery_tabs, current_gallery_tab, output, last_choice, audio_files_paths, audio_file_selected, audio_gallery_refresh_trigger, gen_info, generate_btn, add_to_queue_btn, current_gen_column, current_gen_buttons_row, queue_html, abort_btn, earlystop_btn, onemorewindow_btn, gen_info_accordion],
                     show_progress="hidden"
                     )
 
@@ -13507,7 +13556,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                     show_progress="hidden",
                 ).then(fn=prepare_generate_media,
                     inputs= [state],
-                    outputs= [generate_btn, add_to_queue_btn, current_gen_column, current_gen_buttons_row]
+                    outputs= [generate_btn, add_to_queue_btn, current_gen_column, onemorewindow_btn, earlystop_btn]
                 ).then(fn=activate_status,
                     inputs= [state],
                     outputs= [status_trigger],             
@@ -13537,13 +13586,13 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                     inputs=[load_queue_btn, state],
                     outputs=[queue_html]
                 ).then(
-                     fn=lambda s: (gr.update(visible=bool(get_gen_info(s).get("queue",[]))), gr.Accordion(open=True)) if bool(get_gen_info(s).get("queue",[])) else (gr.update(visible=False), gr.update()),
+                     fn=lambda s: gr.Accordion(open=True) if get_gen_info(s).get("queue", []) else gr.update(),
                      inputs=[state],
-                     outputs=[current_gen_column, queue_accordion]
+                     outputs=[queue_accordion]
                 ).then(
                     fn=init_process_queue_if_any,
                     inputs=[state],
-                    outputs=[generate_btn, add_to_queue_btn, current_gen_column, ]
+                    outputs=[generate_btn, add_to_queue_btn, current_gen_column, onemorewindow_btn, earlystop_btn]
                 ).then(fn=activate_status,
                     inputs= [state],
                     outputs= [status_trigger],             
