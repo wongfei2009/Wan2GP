@@ -213,6 +213,7 @@ class family_handler:
                 "specialities": [{"name": "hum to song", "aliases": ["humming to song"], "description": "Create a song from a hummed melody, lyrics and music style."}],
             })
             definition.pop("custom_guide")
+            definition.pop("allow_empty_prompt")
         return definition
 
     @staticmethod
@@ -259,6 +260,10 @@ class family_handler:
         # arrangement taken from the style prompt. Writing "[Instrumental]" as a
         # lyric line is the wrong way to ask -- it is sung material to the model.
         if base_model_type == HUM_ARCHITECTURE:
+            # ...but only on the base model: the hum finetune conditions on lyrics
+            # matching the hummed phrasing, and an instrumental hum is untested.
+            if not one_prompt.strip():
+                return "YuE2 Hum requires lyrics and a music style."
             if inputs["audio_prompt_type"] != "A" or inputs["audio_guide"] is None:
                 return "Upload a hummed melody for Hum-to-Song."
             if inputs["model_mode"] not in (0, 1):
