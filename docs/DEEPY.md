@@ -130,8 +130,8 @@ When the latest item is selected, new output is selected automatically. If you a
 
 The chat and generation progress bars show what Deepy and WanGP are doing.
 
-- **Pause** suspends Deepy's current turn without losing it. A generation or tool operation already underway is allowed to finish, then Deepy pauses before the next action. This is useful when another WanGP task needs the GPU.
-- **Resume** continues the same turn from where it paused.
+- **Pause** suspends Deepy's current turn without losing it. Running media generation and postprocessing pause at their next processing checkpoint; other tools finish before Deepy pauses. The Generate panel reflects the same paused state. Postprocessing retains its GPU state while paused.
+- **Resume** continues the same turn and its paused media operation. You can resume from either chat or the Generate panel.
 - **Stop** ends Deepy's current turn. Depending on the **Auto-abort** setting, it may also cancel or remove generation work started by Deepy.
 - **Abort** cancels the active WanGP generation.
 
@@ -340,13 +340,19 @@ For Qwen3.8 27B:
 
 If Deepy frequently unloads other models, runs out of memory, or leaves too little VRAM for media generation, select a smaller model or lower quantization before reducing the context window drastically.
 
-### Speculative Decoding (MTP)
+### Speculative Decoding
 
 Speculative decoding can generate Deepy's text faster by predicting several tokens ahead. More draft tokens can improve speed for some requests but use more VRAM, and the fastest setting varies by model and workload.
 
-- **Auto** enables the feature only on supported models when WanGP detects enough VRAM: normally at least 12 GB for Qwen3.5 9B and 24 GB for Qwen3.8 27B. **Recommended for:** nearly everyone.
-- **Disabled** saves the extra VRAM and avoids spending memory on acceleration. **Recommended for:** tight-memory systems or when Auto prevents a generation model from fitting.
-- **Enabled with 2, 3, or 4 draft tokens** lets you tune for speed manually. Higher is not always faster. **Recommended for:** users willing to benchmark repeated, representative prompts; start with 2.
+Choose a method and **Number of Tokens** on the row above **KV Cache Quantization**. Only compatible methods appear; switching to an incompatible model, quantization, or decoder resets the method to **Auto**.
+
+- **Auto** enables MTP on supported models when WanGP detects enough VRAM: normally at least 12 GB for Qwen3.5 9B and 24 GB for Qwen3.8 27B. The token count is automatic.
+- **Disabled** adds no draft-model VRAM and disables the token control. Use it when memory is tight or prediction is slower for your workload.
+- **MTP** supports 1–8 draft tokens on Qwen3.5 9B and Qwen3.8/Bonsai 27B. Start with 2.
+- **DSpark** supports 1–7 draft tokens on Qwen3.8/Bonsai 27B with the vLLM decoder (including Auto decoder selection).
+- **DFlash2** supports 1–7 draft tokens on Qwen3.8 Q2, Q3 and Q4, and 1–5 on Bonsai PTQ1, with the vLLM decoder (including Auto decoder selection). WanGP selects the Qwen drafter for Q2/Q3/Q4 and the Bonsai-adapted drafter for PTQ1 automatically.
+
+Each method label includes its estimated additional VRAM: approximately 0.5–1 GiB for MTP and 4–5 GiB for DSpark or DFlash2 at roughly 32K context. Auto adds between zero and the MTP cost. Longer context, draft count, and model choice affect actual usage. Compare representative prompts before choosing a prediction method: Disabled can be fastest, especially with Bonsai.
 
 This setting changes response speed, not the quality or speed of image, video, or audio generation.
 
@@ -511,7 +517,7 @@ Create a portrait for an introduction video, generate a short speech explaining 
 - Put recurring model-specific choices in a linked template instead of repeating them in every prompt.
 - Specify a time, frame, or audio track when the source contains several possible references.
 - Ask for word timestamps when segment timestamps are not precise enough.
-- Use **Pause** to temporarily free local resources without abandoning the turn.
+- Use **Pause** to temporarily suspend work without abandoning the turn.
 - Use saved sessions and copied gallery media when a project must remain portable after source files move.
 - You can ask Deepy WanGP-specific questions instead of searching the manuals yourself.
 
