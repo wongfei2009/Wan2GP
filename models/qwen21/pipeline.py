@@ -319,7 +319,7 @@ class Qwen21Pipeline(QwenImage21Pipeline):
                     def packed_denoise(value, guidance):
                         positive, negative = denoise(unpack(value), guidance)
                         return pack(positive), None if negative is None else pack(negative)
-                    latents = unpack(lanpaint(packed_denoise, combine, guide_scale, 1.0, pack(latents), pack(original), pack(noise_source), timestep / 1000, pack(latent_mask.expand(batch_size, -1, 64)), height=height, width=width, vae_scale_factor=16))
+                    latents = unpack(lanpaint(packed_denoise, combine, guide_scale, 1.0, pack(latents), pack(original), pack(noise_source), (timestep / 1000).to(latents.device) if torch.is_tensor(timestep) else timestep / 1000, pack(latent_mask.expand(batch_size, -1, 64)), height=height, width=width, vae_scale_factor=16))
                 positive, negative = denoise(latents, guide_scale)
                 noise = combine(positive, negative, guide_scale, timestep)
                 latents = scheduler.step(noise, timestep, latents, return_dict=False)[0]
