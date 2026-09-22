@@ -19,9 +19,31 @@ _direct_cutlass = False
 _original_forward = None
 _ops_registered = False
 _fusion_logged = False
+_compile_cache_root = None
+_compile_cache_backend = None
+# Bump when changes to INT8 custom operators invalidate compiled graphs.
+_COMPILE_CACHE_VERSION = 1
 # Includes row quantization, a possible INT32 GEMM result, and a temporary output.
 # Never allocate an activation-sized quantization buffer for a whole video.
 _SCRATCH_BYTES = 16 * 1024 * 1024
+
+
+def prepare_compile_cache(enabled):
+    """Isolate compiled graphs by resolved backend; leave eager runs untouched."""
+    global _compile_cache_root, _compile_cache_backend
+    if not enabled or _compile_cache_backend == _backend:
+        return
+    from torch._inductor.runtime.runtime_utils import cache_dir
+
+    if _compile_cache_root is None:
+        _compile_cache_root = cache_dir()
+    path = os.path.join(_compile_cache_root, f"wangp_int8_v{_COMPILE_CACHE_VERSION}", _backend)
+    os.makedirs(path, exist_ok=True)
+    # Reset in-memory graphs as well when switching backends in the same process.
+    torch.compiler.reset()
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = path
+    _compile_cache_backend = _backend
+    print(f"[INT8] Compile Cache: {_backend} (v{_COMPILE_CACHE_VERSION}).")
 
 
 def _probe_kitchen():
@@ -155,7 +177,9 @@ def kitchen_linear_fused(input, weight, bias, input_act, act_weight, act_eps, re
         raise ValueError("Fused INT8 output must match the output shape, dtype and device and be contiguous")
     out = input.new_empty((x.shape[0], n)) if out is None else out.reshape(-1, n)
     r = residual.reshape(-1, n) if residual is not None else None
-    rows = max(32, (_SCRATCH_BYTES // (k + 4)) // 32 * 32)
+    # The raw ConvRot quantizer requires packed rows, including fused SwiGLU input.
+    row_bytes = k + 4 + (x.shape[-1] * x.element_size() if not x.is_contiguous() else 0)
+    rows = max(32, (_SCRATCH_BYTES // row_bytes) // 32 * 32)
     wrap = _kitchen._wrap_for_dlpack
     stream = torch.cuda.current_stream(input.device).cuda_stream
     bias_arg = (_kitchen._gemm_vector_arg(bias, input.device, input.dtype) if bias is not None
@@ -165,10 +189,11 @@ def kitchen_linear_fused(input, weight, bias, input_act, act_weight, act_eps, re
                     if r is not None else None)
     for start in range(0, x.shape[0], rows):
         stop = min(start + rows, x.shape[0])
+        tile = x[start:stop].contiguous()
         q = torch.empty((stop-start, k), device=input.device, dtype=torch.int8)
         qs = torch.empty((stop-start, 1), device=input.device, dtype=torch.float32)
         _kitchen._C.quantize_int8_rowwise_convrot64(
-            wrap(x[start:stop]), wrap(q), wrap(qs), 256, False,
+            wrap(tile), wrap(q), wrap(qs), 256, False,
             _kitchen._input_act_code(input_act), 0, wrap(act_arg), float(act_eps), stream)
         if r is not None:
             used = _kitchen._C.cutlass_int8_dequant_residual(
@@ -181,7 +206,7 @@ def kitchen_linear_fused(input, weight, bias, input_act, act_weight, act_eps, re
                 wrap(out[start:stop]), _kitchen.DTYPE_TO_CODE[input.dtype], stream)
         if not used:
             raise RuntimeError("Comfy Kitchen rejected the fused SM120 INT8 output tile")
-        del q, qs
+        del q, qs, tile
     return out.reshape(*input.shape[:-1], n)
 
 

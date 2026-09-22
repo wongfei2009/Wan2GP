@@ -110,7 +110,7 @@ function Mn(S){
 # Posters are bounded to preview size and cached on thumbnail nodes (so removing
 # media also releases its cache). Never remove a paused Chrome player's poster:
 # loadeddata can precede painting and removing it can leave the player blank.
-_GALLERY_VIDEO_SOURCE = """
+_GALLERY_VIDEO_SOURCE = Path(__file__).with_name('gallery_save.js').read_text(encoding='utf-8') + """
 const wangpGalleryFrames = new WeakMap();
 const wangpGalleryPosters = new WeakMap();
 const wangpGalleryEmptyPoster = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1' height='1'/%3E";
@@ -139,6 +139,7 @@ function wangpGalleryPosterEntry(video, src) {
 }
 function wangpGalleryVideoClear(video) {
     const state = wangpGalleryFrames.get(video);
+    state?.saveCleanup();
     if (state?.request != null) video.cancelVideoFrameCallback(state.request);
     if (state?.ready) video.removeEventListener("loadeddata", state.ready);
     wangpGalleryFrames.delete(video);
@@ -168,6 +169,7 @@ function wangpGalleryVideoSource(video, src) {
     if (video.src !== requestedSrc) j(video, "src", src);
     const state = {request: null, presented: false};
     wangpGalleryFrames.set(video, state);
+    wangpGallerySave(video, state);
     video.addEventListener("error", wangpGalleryVideoError);
     function show(poster) {
         poster.then(value => {
@@ -200,6 +202,13 @@ function wangpGalleryVideoSource(video, src) {
 """
 
 _PATCHES = {
+    'AudioPlayer-DG1QBBp6.js': [
+        # Svelte invalidates timeRef after this DOM write, re-running the
+        # reactive waveform.on() statement and leaking a listener each tick.
+        # Update the DOM without invalidating the ref; avoid same-time writes.
+        ('y&&t(12,y.textContent=ze(m),y)', 'y&&y.textContent!==ze(m)&&(y.textContent=ze(m))'),
+        ('b&&t(13,b.textContent=ze(m),b)', 'b&&b.textContent!==ze(m)&&(b.textContent=ze(m))'),
+    ],
     'Video-C-llMUaJ.js': [
         ('function ki(t){', _GALLERY_VIDEO_SOURCE + 'function ki(t){'),
         ('t[25](e),s=!0', 't[25](e),wangpGalleryVideoMount(e),s=!0'),
