@@ -7,6 +7,7 @@ import dataclasses
 import io
 import logging
 import mimetypes
+import re
 import sys
 import threading
 import time
@@ -39,8 +40,21 @@ _MAX_STORED_EVENTS = 500
 #     (head); a late warning -- an accelerator LoRA being disabled, a fallback
 #     being taken -- arrives mid-job (tail). The uninteresting middle is what
 #     gets dropped.
+#   * The MCP server's OWN request logging is dropped too. Stream capture takes
+#     the whole process's stderr, so every wangp_get_job poll lands as a rich
+#     log record ("INFO Processing request of type" / "Terminating session",
+#     with the message wrapped onto a second "CallToolRequest" line). Polling
+#     starts with the job, so this flooded the HEAD as well as the tail: 176 of
+#     201 stored lines in one sampled image job.
 _MAX_STORED_LOG_HEAD = 120
 _MAX_STORED_LOG_TAIL = 80
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\][^\x1b\x07]*(?:\x1b\\|\x07)|\x1b\[[0-9;?]*[A-Za-z]")
+# A record logged from inside the MCP/HTTP stack: rich links its source file.
+_TRANSPORT_LOG_SOURCE_RE = re.compile(r"site-packages[\\/](?:mcp|uvicorn|starlette|sse_starlette)[\\/]")
+# The same records without rich, and rich's wrapped continuation of them.
+_TRANSPORT_LOG_TEXT_RE = re.compile(
+    r"Processing request of type \w+|Terminating session:|^(?:[A-Z]\w*(?:Request|Notification))$"
+)
 _MEDIA_TRANSFER_TTL_SECONDS = 600
 _MAX_UPLOAD_BYTES = 8 * 1024**3
 _TRANSPORT_ALIASES = {
@@ -1247,6 +1261,9 @@ class _JobRecord:
         # A tqdm redraw, not a log line. These arrive once per step and would
         # push the load banner out of both ends within seconds.
         if "%|" in text and data.get("stream") == "stderr":
+            return
+        # The MCP server logging our own polls, not the job. See the ring's notes.
+        if _TRANSPORT_LOG_SOURCE_RE.search(text) or _TRANSPORT_LOG_TEXT_RE.search(_ANSI_ESCAPE_RE.sub("", text).strip()):
             return
         entry = {"timestamp": event_dict.get("timestamp"), "stream": data.get("stream"), "text": text}
         if len(self.log_head) < _MAX_STORED_LOG_HEAD:
