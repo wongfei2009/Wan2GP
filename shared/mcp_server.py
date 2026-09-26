@@ -62,6 +62,7 @@ _DEEPY_MODEL_DEF_STRING_LIMIT = 256
 _TOOLBOX_ACTIONS = {
     "add_to_gallery",
     "create_color_frame",
+    "image_channels",
     "inspect_media",
     "inspect_video",
     "extract_image",
@@ -69,6 +70,7 @@ _TOOLBOX_ACTIONS = {
     "extract_audio",
     "transcribe_media",
     "mute_video",
+    "remove_vocals",
     "replace_audio",
     "resize_crop",
     "side_by_side",
@@ -86,11 +88,14 @@ _TOOLBOX_MEDIA_PARAMETERS = {
     "extract_audio": ("media_id",),
     "transcribe_media": ("media_id",),
     "mute_video": ("media_id",),
+    "remove_vocals": ("media_id",),
     "replace_audio": ("video_id", "audio_id"),
+    "remux_media": ("video_id", "audio_ids"),
     "resize_crop": ("media_id",),
     "side_by_side": ("media_ids",),
     "merge_videos": ("video_first", "video_second"),
     "get_media_details": ("media_id",),
+    "image_channels": ("media_id",),
 }
 _POSTPROCESS_PATH_PARAMETERS = {
     "audio_media_id": "audio_path",
@@ -1075,7 +1080,7 @@ def _resolve_toolbox_arguments(session, toolbox, action: str, arguments: dict[st
         raw_value = resolved.get(parameter_name, None)
         if raw_value is None:
             continue
-        if parameter_name in {"media_ids", "paths"} and not isinstance(raw_value, list):
+        if parameter_name in {"media_ids", "audio_ids", "paths"} and not isinstance(raw_value, list):
             raise ValueError(f"{parameter_name} must be an array.")
         values = raw_value if isinstance(raw_value, list) else [raw_value]
         resolved_values = []
@@ -1095,6 +1100,14 @@ def _resolve_toolbox_arguments(session, toolbox, action: str, arguments: dict[st
             resolved_input["media_id"] = resolve_media_id(resolved_input.get("media_id"), f"media_inputs[{index}].media_id")
             resolved_inputs.append(resolved_input)
         resolved["media_inputs"] = resolved_inputs
+    if action == "image_channels" and resolved.get("channel_sources") is not None:
+        raw_sources = resolved["channel_sources"]
+        if not isinstance(raw_sources, dict):
+            raise ValueError("channel_sources must be an object.")
+        resolved["channel_sources"] = {
+            channel: resolve_media_id(value, f"channel_sources.{channel}")
+            for channel, value in raw_sources.items()
+        }
     return resolved
 
 
