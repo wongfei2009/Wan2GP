@@ -947,97 +947,6 @@ class WanGPSession:
             record.update({"size_bytes": os.path.getsize(local_path), "already_existed": False})
         return record
 
-    def generate_mask(self, image: str, keywords: str, *, negative: bool = False, fill_holes: bool = True) -> dict[str, Any]:
-        from shared import magic_mask
-        from shared.utils.download import process_files_def
-        from shared.utils.process_locks import acquire_GPU_ressources, release_GPU_ressources
-
-        parsed_keywords = magic_mask.parse_keywords(keywords)
-        if len(parsed_keywords) == 0:
-            raise ValueError("keywords must contain at least one keyword")
-        # Fail fast rather than block: acquire_GPU_ressources would wait out a whole
-        # video job and the MCP request would just hang.
-        with self._job_lock:
-            if self._active_job is not None and not self._active_job.done:
-                raise RuntimeError("WanGP session already has a generation in progress")
-        runtime = self._ensure_runtime()
-        with _pushd(runtime.root):
-            # _output_dir is only set when the server was started with --output-dir;
-            # otherwise images land in the runtime's own image_save_path, the same
-            # directory the file server serves.
-            output_dir = self._output_dir if self._output_dir is not None else getattr(runtime.module, "image_save_path", None) or "outputs"
-            output_root = os.path.realpath(str(output_dir))
-            source_path = _resolve_in_outputs(image, output_root, "Image")
-            process_files_def(**magic_mask.query_download_def())
-            acquire_GPU_ressources(self._state, magic_mask.PROCESS_ID, magic_mask.PROCESS_NAME)
-            try:
-                # generate_image_mask builds its own SAM3 predictor and shuts it down
-                # (weights back to CPU + empty cache) before returning, so the next
-                # generation does not inherit a SAM3-sized hole in VRAM.
-                _, mask_image, used_keywords = magic_mask.generate_image_mask(
-                    source_path,
-                    keywords,
-                    no_hole=bool(fill_holes),
-                    negative_mask=bool(negative),
-                )
-            finally:
-                release_GPU_ressources(self._state, magic_mask.PROCESS_ID)
-        stem = Path(source_path).stem
-        suffix = magic_mask.truncate_keywords_for_path(used_keywords)
-        name = f"{stem}_mask_{suffix}_{time.strftime('%Y%m%d_%H%M%S')}.png"
-        mask_path = Path(output_root) / name
-        mask_image.save(mask_path)
-        return {
-            "mask": str(mask_path.resolve()),
-            "keywords": used_keywords,
-            "negative": bool(negative),
-            "width": mask_image.width,
-            "height": mask_image.height,
-        }
-
-    def generate_video_mask(self, video: str, keywords: str, *, negative: bool = False, fill_holes: bool = True, max_seconds: float | None = None) -> dict[str, Any]:
-        from shared import magic_mask
-        from shared.utils.download import process_files_def
-        from shared.utils.process_locks import acquire_GPU_ressources, release_GPU_ressources
-
-        parsed_keywords = magic_mask.parse_keywords(keywords)
-        if len(parsed_keywords) == 0:
-            raise ValueError("keywords must contain at least one keyword")
-        # Fail fast rather than block: acquire_GPU_ressources would wait out a whole
-        # video job and the MCP request would just hang.
-        with self._job_lock:
-            if self._active_job is not None and not self._active_job.done:
-                raise RuntimeError("WanGP session already has a generation in progress")
-        runtime = self._ensure_runtime()
-        with _pushd(runtime.root):
-            output_dir = self._output_dir if self._output_dir is not None else getattr(runtime.module, "image_save_path", None) or "outputs"
-            output_root = os.path.realpath(str(output_dir))
-            source_path = _resolve_in_outputs(video, output_root, "Video")
-            process_files_def(**magic_mask.query_download_def())
-            acquire_GPU_ressources(self._state, magic_mask.PROCESS_ID, magic_mask.PROCESS_NAME)
-            try:
-                # magic_mask.generate_video_mask defaults output_dir to "mask_outputs",
-                # which the file server (rooted at the outputs dir) does not serve.
-                # Passing output_root is the whole routing change: everything else --
-                # SAM3 per frame, the binary hard edge, the MP4 writer -- is unchanged.
-                # Deliberately not exposing colorize/background: --video-mask consumes
-                # a binary black-and-white mask and nothing else.
-                mask_path, used_keywords = magic_mask.generate_video_mask(
-                    source_path,
-                    keywords,
-                    no_hole=bool(fill_holes),
-                    negative_mask=bool(negative),
-                    max_time_seconds=max_seconds,
-                    output_dir=output_root,
-                )
-            finally:
-                release_GPU_ressources(self._state, magic_mask.PROCESS_ID)
-        return {
-            "mask": str(Path(mask_path).resolve()),
-            "keywords": used_keywords,
-            "negative": bool(negative),
-        }
-
     def _run_matanyone(self, frames, seed, *, version: str, erode: int, dilate: int, warmup: int):
         import numpy as np
         import torch
@@ -1080,7 +989,7 @@ class WanGPSession:
             raise ValueError("pass exactly one of keywords or seed_mask")
         version = normalize_matanyone_version(matanyone_version)
         if version == MATANYONE_SAM3:
-            raise ValueError("matanyone_version must be a MatAnyone checkpoint ('v1' or 'v2'); SAM3 is a separate engine -- use generate_mask for a binary mask")
+            raise ValueError("matanyone_version must be a MatAnyone checkpoint ('v1' or 'v2'); SAM3 is a separate engine -- use the wangp_toolbox create_mask action for a binary mask")
         # Fail fast rather than block: acquire_GPU_ressources would wait out a whole
         # video job and the MCP request would just hang.
         with self._job_lock:
