@@ -63,7 +63,7 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 
 ## 🔥 Latest Updates : 
-## 27th of September 2026: WanGP v13.14 — Community Release
+## 29th of September 2026: WanGP v13.141 — Community Release
 
 Thanks to **WanGP community** contributing code, testing and feedback!
 
@@ -90,6 +90,14 @@ Thanks to **WanGP community** contributing code, testing and feedback!
 - **H3 Keeps Your Soundtrack**: Ref2VA can now build a video around uploaded speech/music or a reference video's soundtrack, keeping the original audio synchronized across sliding windows. Select an audio choice marked *Soundtrack Kept*.
 
 - **H3 Learns to Hold Still**: select **Text to Image** for a single still. The prompt enhancer gains dedicated image prompts, including reference-based edits. 
+
+- **H3 Ref2VA Frames Injection**: Ref2VA should be now on par with Fl2VA. But keep in mind, you will get better results with Fl2VA for Start,End,Injected Frames and Text2Video
+
+- **H3 In-Context LoRAs**: **Use Control Video as In-Context Guide** enables compatible face/character-swap LoRAs. The previous editing mode is renamed **Denoise Control Video (Video-to-Video Edit)**.
+
+- **H3 ControlNet-Union 2.0**: **FL2VA 33B and Pruned 20B** gain pose, depth, edge, shape and recoloring controls, plus inpainting and spatial outpainting. 
+
+- **Floating Generate Buttons**: controls float on the right until their normal position is visible; Edit Mode buttons float too. Enabled by default in **Configuration / General**.
 
 - **Three Voices, One Conversation**: three uploaded voice references now work with **H3 Audio, Qwen3 TTS Base, OmniVoice, KugelAudio, IndexTTS2/2.5, DramaBox and Scenema**. Use `Speaker 1:` through `Speaker 3:`; Scenema applies its references through SeedVC.
 
@@ -241,7 +249,7 @@ Use this script to get the latest updates for WAN2GP and upgrade dependencies.
 * **1. Update:** Fetches the latest code from GitHub and updates requirements.
 * **2. Upgrade:** Allows you to manually individually upgrade heavy backend components (like PyTorch, Triton, Sage Attention).
 
-Triton recommendations follow both your GPU and selected PyTorch: **3.3.x with PyTorch 2.7**, **3.6.x with PyTorch 2.10** on RTX 30XX or newer, and **3.2.x on RTX 20XX**. Use **Upgrade** to correct an older Triton installation; **Update** alone does not change it.
+Triton recommendations follow both your GPU and selected PyTorch: **3.3.x with PyTorch 2.7**, **3.6.x with PyTorch 2.10** on RTX 30XX or newer, **3.2.x on RTX 20XX**, and **3.7.x with PyTorch 2.13** on AMD. Use **Upgrade** to correct an older Triton installation; **Update** alone does not change it.
 
 #### 4️⃣ Managing Environments (`scripts\manage.bat` | `scripts/manage.sh`)
 Use this script to manage and switch between your sandboxed environments safely.
