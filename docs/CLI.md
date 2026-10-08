@@ -226,7 +226,7 @@ For Flux dev at 1024x1024, a manual 6000 MB shortened the profile 4 steps by abo
 ```bash
 --perc-reserved-mem-max FLOAT # Share of RAM that pinning may lock, as a fraction (0.4 = 40%)
 ```
-Pinned ("reserved") RAM makes the transfers to the GPU fast, but nothing else can use it. *Configuration / RAM/VRAM Management / Reserved RAM for Pinning* sets the share of RAM that WanGP may pin, in percent (0 = automatic: 40% on Windows, 80% on Linux). `--perc-reserved-mem-max` takes precedence over this setting, which takes precedence over the `perc_reserved_mem_max` environment variable.
+Pinned ("reserved") RAM makes the transfers to the GPU fast, but nothing else can use it. *Configuration / RAM/VRAM Management / Reserved RAM for Pinning* sets the share of RAM that WanGP may pin, in percent (0 = automatic: 40% on Windows, 60% on Linux). `--perc-reserved-mem-max` takes precedence over this setting, which takes precedence over the `perc_reserved_mem_max` environment variable.
 
 When the models do not all fit in it, WanGP reserves first the parts used at every step; with [Smart Memory Pinning](#smart-memory-pinning), the rest still reaches the GPU almost as fast, so a smaller share mostly costs speed on short steps.
 
@@ -245,15 +245,18 @@ The *MMGP Optimized VRAM Allocator* (*Configuration / RAM/VRAM Management / VRAM
 | Flux dev 1024x1024 (image decoding) | about 1.3 GB |
 | Deepy, Bonsai 2 27B, 20K-token prompt | about 0.2 GB |
 
-The gain grows with the resolution and duration. The setting applies when WanGP starts; `--vram-allocator` takes precedence over it. It works on Windows and Linux with PyTorch 2.3 or newer and NVIDIA GPUs; elsewhere, WanGP says so at startup and uses PyTorch's allocator. The VRAM used by other programs on the same GPU (another WanGP, ComfyUI, a game, a browser) is left to them; only when a generation would otherwise stop with an out of memory error does WanGP take the VRAM they are not using, which Windows then moves to system RAM. When the error happens anyway, its message shows the VRAM free on the whole GPU and for WanGP, how much more was needed, and why it was refused.
+The gain grows with the resolution and duration. The setting applies when WanGP starts; `--vram-allocator` takes precedence over it. It works on Windows and Linux with PyTorch 2.3 or newer and NVIDIA GPUs; elsewhere, WanGP says so at startup and uses PyTorch's allocator. The VRAM used by other programs on the same GPU (another WanGP, ComfyUI, a game, a browser) is left to them; only when WanGP would otherwise run out of VRAM does it take the VRAM they are not using, which Windows then moves to system RAM. When the error happens anyway, its message shows the VRAM free on the whole GPU and for WanGP, how much more was needed, and why it was refused.
 
-*With RAM Spilling* (the default), when VRAM runs out, what no longer fits goes to system RAM instead of stopping the generation: the steps that use it are much slower, but a generation slightly too large for your VRAM can finish. Spilling stops, with an out of memory error, when it would leave less than a tenth of the RAM (at least 4 GB) available. On a GPU that also drives your display, the screen may flash or go black for a moment meanwhile, without affecting the generation. Without spilling (`vmm`), running out of VRAM stops the generation with an out of memory error, instead of slowly spilling into shared GPU memory as the NVIDIA driver otherwise does on Windows.
+*With RAM Spilling* (the default), when VRAM runs out, what no longer fits goes to system RAM instead of stopping the generation: the steps that use it are much slower, but a generation slightly too large for your VRAM can finish. When that would leave less than a tenth of the RAM (at least 4 GB) available, the NVIDIA driver takes over on Windows and places what no longer fits in shared GPU memory, as it does with PyTorch's allocator: a generation that finishes with PyTorch's allocator also finishes with this one. On a GPU that also drives your display, the screen may flash or go black for a moment meanwhile, without affecting the generation. Without spilling (`vmm`), running out of VRAM stops the generation with an out of memory error, instead of slowly spilling into shared GPU memory as the NVIDIA driver otherwise does on Windows.
 
-### VRAM Debug Mode
+### RAM Allocator
 ```bash
---vram-allocator vmm --vram-debug 16   # Record the allocations of 16 MB and more
+--ram-allocator mmgp      # MMGP RAM Allocator (default)
+--ram-allocator default   # PyTorch's CPU allocator
 ```
-For developers and agents looking for VRAM to save: with the *MMGP Optimized VRAM Allocator*, `--vram-debug MIN_MB` records every allocation of `MIN_MB` and more with the model module that made it and its Python stack. After each generation WanGP writes a report to `vram_debug` in the output folder: for each phase (text encoding, denoising, decoding), the tensors alive at its peak with their sizes, modules and source lines, the totals of the short-lived scratch buffers, and the large tensors still alive at the end. `python -m mmgp.allocator.debug summary <report.json>` prints a report, `python -m mmgp.allocator.debug diff <before.json> <after.json>` compares the peaks of two runs. Generation speed is unchanged.
+Same as *Configuration > RAM/VRAM Management > RAM Allocator*. PyTorch keeps the RAM of the CPU tensors it frees (decoded frames, converted weights, frames waiting to be saved) to reuse it later: after a generation or after a model is released, several GB can stay in use, and on Windows the *committed* memory shown by the Task Manager can grow up to twice what these tensors need. With the *MMGP RAM Allocator*, the RAM of the CPU tensors of 1 MB and more goes back to the system when the queue is done, when a model is released, and whenever the RAM runs short (before the VRAM allocator would have to spill into RAM). While generations of the same model follow one another, up to 2 GB of it (5% of the RAM on smaller PCs) is kept for the next one, which reuses it at full speed; nothing is released in the middle of a generation unless the RAM runs short. It also commits only what each tensor needs, where PyTorch's allocator on Windows can commit up to twice as much.
+
+The setting applies when WanGP starts; `--ram-allocator` takes precedence over it. It works on Windows and Linux with PyTorch 2.6 to 2.15; elsewhere, WanGP says so at startup and uses PyTorch's allocator.
 
 ### Windows Power Throttling
 ```bash

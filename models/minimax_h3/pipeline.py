@@ -17,7 +17,9 @@ from mmgp import offload
 from shared.utils.loras_mutipliers import update_loras_slists
 from shared.utils.text_encoder_cache import TextEncoderCache
 from shared.utils.phase_progress import control_video_encoding, generation_progress
+from shared.utils.utils import guide_mask_to_float, guide_to_float
 from shared.utils.frame_scheduler import floor_frame_count, normalize_frame_count, normalize_overlap
+from shared.utils.utils import convert_video_tensor_to_uint8_chunked
 from .constants import (H3_AUDIO_REFINEMENT_DENOISE, H3_AUDIO_REFINEMENT_SETTING, H3_AUDIO_REFINEMENT_STEPS, H3_CONTROL_LATENT_CONTINUATION,
                         H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, h3_grouped_masking_enabled)
 from .dialogue import H3_DIALOGUE_GENERATION, generate_dialogue, is_dialogue_prompt
@@ -87,6 +89,11 @@ def _resize_video(video, height, width):
     video = _as_video(video)
     if video is None or video.shape[-2:] == (height, width):
         return video
+    if video.dtype == torch.uint8:  # a uint8 control video (model_def "uint8_guides"): resized by chunks of frames from WanGP's float values
+        output = torch.empty((video.shape[0], video.shape[1], height, width), dtype=torch.float32, device=video.device)
+        for start in range(0, video.shape[1], 16):
+            output[:, start:start + 16] = _resize_video(guide_to_float(video[:, start:start + 16]), height, width)
+        return output
     return F.interpolate(video.permute(1, 0, 2, 3), size=(height, width), mode="bicubic", align_corners=False, antialias=True).permute(1, 0, 2, 3)
 
 
@@ -142,12 +149,12 @@ def _build_frozen_control_video(input_frames, input_video, frame_num, prefix_fra
     remaining = output_frames - sum(piece.shape[1] for piece in pieces)
     if remaining:
         control = control[:, -remaining:] if pieces and control.shape[1] > remaining else control[:, :remaining]
-        pieces.append(control)
+        pieces.append(guide_to_float(control))
     return torch.cat(pieces, dim=1) if len(pieces) > 1 else pieces[0]
 
 
 def _qwen_frames(video):
-    return video.permute(1, 2, 3, 0).add(1.0).mul_(0.5).clamp_(0.0, 1.0)
+    return guide_to_float(video).permute(1, 2, 3, 0).add(1.0).mul_(0.5).clamp_(0.0, 1.0)
 
 
 def _fit_audio_samples(audio, sample_count):
@@ -156,7 +163,7 @@ def _fit_audio_samples(audio, sample_count):
 
 def _resize_video_mask(mask, latent_shape, clip_length, temporal_ratio, binarize=True):
     latent_t, latent_h, latent_w = latent_shape
-    mask = mask[:1].unsqueeze(0).float()
+    mask = guide_mask_to_float(mask[:1]).unsqueeze(0).float()
     pad_frames = (-mask.shape[2]) % clip_length
     if pad_frames:
         mask = F.pad(mask, (0, 0, 0, 0, 0, pad_frames), mode="replicate")
@@ -231,10 +238,10 @@ def _build_outpainting_mask(video, outpainting_dims):
 def _encode_video_source(vae, video, device, outpainting_dims=None):
     location = _outpainting_frame_location(video, outpainting_dims)
     if location is None:
-        return vae.encode(video.unsqueeze(0).to(device=device, dtype=vae._model_dtype))
+        return vae.encode(video.unsqueeze(0), device)
     inner_height, inner_width, top, left = location
     source = video[..., top:top + inner_height, left:left + inner_width]
-    source_latents = vae.encode(source.unsqueeze(0).to(device=device, dtype=vae._model_dtype))
+    source_latents = vae.encode(source.unsqueeze(0), device)
     ratio = vae.spatial_compression_ratio
     latents = source_latents.new_zeros((*source_latents.shape[:-2], math.ceil(video.shape[-2] / ratio), math.ceil(video.shape[-1] / ratio)))
     latent_top, latent_left = top // ratio, left // ratio
@@ -501,7 +508,7 @@ class MiniMaxH3Pipeline:
 
     def _encode_video(self, video, keep_all_latents=False):
         self._check_abort()
-        return self.vae.encode_condition(video.unsqueeze(0).to(device=self.device, dtype=self.vae._model_dtype), keep_all_latents=keep_all_latents).cpu()
+        return self.vae.encode_condition(video.unsqueeze(0), self.device, keep_all_latents=keep_all_latents).cpu()
 
     def _waveform(self, waveform, sample_rate):
         if waveform is None:
@@ -690,8 +697,8 @@ class MiniMaxH3Pipeline:
             with control_video_encoding():
                 return _encode_video_source(self.vae, video, self.device).float().cpu()
 
-        frames = fit(control_frames)
-        mask = None if masks is None else fit(masks[:1]).gt(0.5)
+        frames = fit(guide_to_float(control_frames[:, :frame_count]))
+        mask = None if masks is None else fit(guide_mask_to_float(masks[:1, :frame_count])).gt(0.5)
         control_rows = inpaint_rows = None
         if not inpaint_only:
             control_rows = patchify_video(encode(frames if mask is None else torch.where(mask, frames, -1.0)), patch)
@@ -836,13 +843,15 @@ class MiniMaxH3Pipeline:
             # Raw preprocessing keeps the source picture; only the expanded borders are editable.
             input_masks = torch.zeros_like(input_frames[:1]) if outpainting_mask is None else outpainting_mask
         elif outpainting_mask is not None:
-            input_masks = outpainting_mask if input_masks is None else torch.maximum(input_masks.float(), outpainting_mask.to(device=input_masks.device))
+            input_masks = outpainting_mask if input_masks is None else torch.maximum(guide_mask_to_float(input_masks).float(), outpainting_mask.to(device=input_masks.device))
         video_to_video = control_video and not audio_from_control_video and (float(denoising_strength) < 1.0 or input_masks is not None)
         control_source = None
         if video_to_video:
             control_source = _as_video(input_frames)[:, history_count:history_count + aligned_target_frames]
             if control_start_frame is not None:
-                control_source = torch.cat((_resize_video(control_start_frame, *control_source.shape[-2:]).to(control_source), control_source[:, 1:]), dim=1)
+                control_frames = guide_to_float(control_source[:, 1:])
+                control_source = torch.cat((_resize_video(control_start_frame, *control_source.shape[-2:]).to(control_frames), control_frames), dim=1)
+                control_frames = None
         control_start_frame = None
         if grouped_masked_denoising and video_to_video and input_masks is not None and not preserve_input_mask_values and offload.shared_state.get("_attention") == "sol":
             raise ValueError("MiniMax H3 Grouped Rows mask denoising is not compatible with Sol Attention; select Shared Timestep or another attention mode")
@@ -986,7 +995,7 @@ class MiniMaxH3Pipeline:
                 target_video_condition = self._encode_video(_resize_video(frozen_target_video, height, width), keep_all_latents=True)
         if self.reference_mode and self.fixed_prompt is None:
             if image_outputs and video_references:
-                input_ref_images = [*(input_ref_images or []), input_frames]
+                input_ref_images = [*(input_ref_images or []), guide_to_float(input_frames)]
                 video_references = False
             for image in input_ref_images or []:
                 self._add_image_reference(image, width, height, image_refs_relative_size, presentation, visual_latents, refs)
@@ -1100,6 +1109,7 @@ class MiniMaxH3Pipeline:
         if set_progress_status is not None:
             set_progress_status("Encoding H3 prompt and references")
         context, text_tags = self._encode_prompt(input_prompt, presentation)
+        presentation = None  # the frames shown to the text encoder are no longer needed (phase 2 builds its own)
         self._check_abort()
         self._use_transformer()
         context = self.transformer.preprocess_text_embeds(context)
@@ -1676,16 +1686,22 @@ class MiniMaxH3Pipeline:
         # The shared return_latent_slice is expressed in frame-step units, not H3's VAE units.
         latent_slice = {"latents": video.detach().cpu(), "start_frame": window_start_frame_no} if H3_CONTROL_LATENT_CONTINUATION and control_target_anchors and not image_outputs else None
         control_anchor_indices = control_anchor_latents = control_anchor_noised = None
+        # videos are decoded to uint8 frames, which only reach the RAM converted, with the rounding WGP (truncate) or the tiled phase 2 (round)
+        # gave them; images and refinements (the H3 Face Refiner blends signed windows) keep a float video
+        uint8_rounding = "round" if tiled_phase_2 else None if image_outputs or refinement_mode else "truncate"
+        to_uint8 = _video_to_uint8_cpu if tiled_phase_2 else convert_video_tensor_to_uint8_chunked
         if not self.audio_only and decoded_video is None:
             if frozen_target_video is None:
                 video = video.to(self.vae._model_dtype)
-                decoded_video = self.vae.decode(video).clamp_(-1.0, 1.0)[0, :, :target_frames]
-                decoded_video = _video_to_uint8_cpu(decoded_video) if tiled_phase_2 else decoded_video.cpu()
+                decoded_video = self.vae.decode(video, uint8_rounding)[0, :, :target_frames]
+                if uint8_rounding is None:
+                    decoded_video = decoded_video.clamp_(-1.0, 1.0)
             else:
                 decoded_video = frozen_target_video[:, :target_frames].cpu()
         video = None
         for frame_index, known in control_frame_anchors:  # restore exact supplied pixels after the VAE round trip
-            decoded_video[:, frame_index:frame_index + known.shape[1]] = _resize_video(known.float(), *decoded_video.shape[-2:]).to(decoded_video)
+            known = _resize_video(known.float(), *decoded_video.shape[-2:])
+            decoded_video[:, frame_index:frame_index + known.shape[1]] = (to_uint8(known) if decoded_video.dtype == torch.uint8 else known).to(decoded_video)
         if image_outputs:
             audio = None
             self._check_abort()
@@ -1703,7 +1719,7 @@ class MiniMaxH3Pipeline:
             if (two_phase or self.vae.upsampling) and output_prefix.shape[-2:] != decoded_video.shape[-2:]:
                 output_prefix = _resize_video(output_prefix, decoded_video.shape[-2], decoded_video.shape[-1])
             if decoded_video.dtype == torch.uint8 and output_prefix.dtype != torch.uint8:
-                output_prefix = output_prefix.clamp(-1.0, 1.0).add_(1.0).mul_(127.5).round_().to(torch.uint8)
+                output_prefix = output_prefix.clamp(-1.0, 1.0).add_(1.0).mul_(127.5).round_().to(torch.uint8) if tiled_phase_2 else to_uint8(output_prefix)
             decoded_video = torch.cat((output_prefix.to(decoded_video), decoded_video), dim=1)
             if history_waveform is not None:
                 prefix_samples = round(output_prefix_count / fps * AUDIO_SAMPLE_RATE)

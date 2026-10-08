@@ -3,6 +3,8 @@ import os, sys
 os.environ["GRADIO_LANG"] = "en"
 # ROCm: without it, SDPA silently falls back to the math kernel on GPUs where AOTriton is still marked experimental
 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+# OpenBLAS (NumPy, SciPy) commits a 32 MiB buffer per thread at import: 1.5 GB with 24 threads, unused by WanGP's PyTorch computations
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(min(8, os.cpu_count() or 8)))
 p = os.path.dirname(os.path.abspath(__file__))
 if p not in sys.path:
     sys.path.insert(0, p)
@@ -31,7 +33,7 @@ is_mps = sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.b
 if is_mps:
     from shared.mps.device_patch import apply_mps_patch
     apply_mps_patch()
-from shared.cuda_memory import apply_startup_settings, write_vram_debug_report; apply_startup_settings(sys.argv, "wgp_config.json") # VRAM allocator and CUDA stack reserve, before anything initializes CUDA
+from shared.cuda_memory import apply_startup_settings, write_vram_debug_report, write_ram_debug_report, ram_debug_mark, release_ram_cache; apply_startup_settings(sys.argv, "wgp_config.json") # VRAM allocator and CUDA stack reserve, before anything initializes CUDA
 
 import time
 import threading
@@ -71,7 +73,7 @@ from shared.utils.setting_names import unknown_settings_error
 from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_loras_multipliers
 from shared.utils.utils import convert_tensor_to_image, convert_video_tensor_to_uint8_chunked, save_image, get_video_info, get_file_creation_date, convert_image_to_video, calculate_new_dimensions, convert_image_to_tensor, calculate_dimensions_and_resize_image, rescale_and_crop, get_video_frame, resize_and_remove_background, rgb_bw_to_rgba_mask, image_editor_layer_to_rgb_mask, to_rgb_tensor, get_resampled_video_transparent, get_video_summary_extras
 from shared.utils.utils import calculate_new_dimensions, get_outpainting_dims, get_outpainting_frame_location, get_outpainting_full_area_dimensions, resolve_outpainting_dims
-from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension
+from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension, guide_to_float, guide_mask_to_float
 from shared.utils.audio_video import extract_audio_tracks, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_volumes_to_temp_files, save_video, save_hdr_video, save_image, get_image_format, get_media_duration_and_audio_layouts
 from shared.utils.audio_video import append_sliding_window_audio, read_image_metadata, extract_audio_track_to_wav, write_wav_file, save_audio_file, get_audio_codec_extension, create_silent_wav_file
 from shared.utils.audio_video import truncate_audio, shift_audio_trim_ranges, trim_audio_ranges, trim_audio_file_ranges, slice_audio_window, resolve_mux_audio_sampling_rate
@@ -161,6 +163,7 @@ from shared import settings_metadata
 from postprocessing import audio_processors as audio_processor_api
 from postprocessing import temporal_upsamplers as temporal_upsampler_api
 from postprocessing import spatial_upsamplers as upsampler_api
+from postprocessing.lanczos import resize_lanczos_spatial
 from shared.cli_args import parse_wgp_args
 from collections import defaultdict
 
@@ -178,7 +181,7 @@ AUTOSAVE_ERROR_FILENAME = "error_queue.zip"
 AUTOSAVE_TEMPLATE_PATH = AUTOSAVE_FILENAME
 CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
-WanGP_version = "17.01"
+WanGP_version = "17.17"
 settings_version = 2.79
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
@@ -267,6 +270,7 @@ def release_model():
     gc.collect()
     torch.cuda.empty_cache()
     reload_needed = True
+    write_ram_debug_report(save_path, "model_release", census_label="after model release")
 def get_unique_id():
     global unique_id  
     with unique_id_lock:
@@ -4076,6 +4080,7 @@ def ensure_prompt_enhancer_loaded(override_profile=-1, progress=None, send_cmd=N
 @controlled_model_loading
 def load_models(model_type, override_profile = -1, output_type="video", config_id = None, runtime_model_type=None, track_as_main=True, gen=None, loading_callback=None, **model_kwargs):
     global transformer_type, loaded_profile, loaded_config
+    ram_debug_mark(f"loading {model_type}")
     def _load_models_info(message):
         if int(verbose_level) > 0:
             print(message)
@@ -4734,6 +4739,7 @@ def _finalize_generation(state):
     time.sleep(0.2)
     global gen_in_progress
     gen_in_progress = False
+    release_ram_cache()  # the queue is done: the RAM a next generation of the same model would have reused goes back to the system
     gen["early_stop"] = False
     gen["early_stop_forwarded"] = False
     return gallery_tabs, 1 if last_was_audio else 0, gr.update() if last_was_audio else gallery_update(gen.get("file_list", []), choice),  *pack_audio_gallery_state(audio_file_list, audio_choice), gr.Button(interactive=  True), gr.Button(interactive=  True, visible= False), gr.Button(visible= True), gr.Button(visible= False), gr.Column(visible= False), gr.HTML(visible= False, value="")
@@ -5572,7 +5578,9 @@ def extract_faces_from_video_with_mask(input_video_path, input_mask_path, max_fr
     return face_tensor
 
 
-def preprocess_video_with_mask(pre_video_guide, input_video_path, input_mask_path, height, width,  max_frames, start_frame=0, fit_canvas = None, fit_crop = False, target_fps = 16, block_size= 16, expand_scale = 2, process_type = "inpaint", process_type2 = None, to_bbox = False, RGB_Mask = False, negate_mask = False, process_outside_mask = None, inpaint_color = 127, outpainting_dims = None, outpainting_ratio = "", proc_no = 1, outpainting_quantize_margins = 0):
+def preprocess_video_with_mask(pre_video_guide, input_video_path, input_mask_path, height, width,  max_frames, start_frame=0, fit_canvas = None, fit_crop = False, target_fps = 16, block_size= 16, expand_scale = 2, process_type = "inpaint", process_type2 = None, to_bbox = False, negate_mask = False, process_outside_mask = None, inpaint_color = 127, outpainting_dims = None, outpainting_ratio = "", proc_no = 1, outpainting_quantize_margins = 0, uint8_output = False):
+    # Returns the guide (C, T, H, W) and its mask (1, T, H, W) or None: float in [-1, 1] / [0, 1], or uint8 0-255 / 0, 255 with uint8_output
+    # (model_def "uint8_guides").
 
     def mask_to_xyxy_box(mask):
         rows, cols = np.where(mask == 255)
@@ -5651,9 +5659,8 @@ def preprocess_video_with_mask(pre_video_guide, input_video_path, input_mask_pat
     if any_identity_mask:
         any_mask = True
 
-    proc_list =[]
-    proc_list_outside =[]
-    proc_mask = []
+    # the identity mask keeps every pixel: one array shared by all the frames (no pixel selected, so expansion / bbox leave it empty)
+    identity_mask = np.zeros((height, width), dtype=np.uint8) if any_identity_mask else None
 
     # for frame_idx in range(num_frames):
     def prep_prephase(frame_idx):
@@ -5661,23 +5668,22 @@ def preprocess_video_with_mask(pre_video_guide, input_video_path, input_mask_pat
         if fit_crop:
             frame = rescale_and_crop(frame, width, height)
         else:
-            frame = frame.resize((width, height), resample=Image.Resampling.LANCZOS) 
-        frame = np.array(frame) 
+            frame = frame.resize((width, height), resample=Image.Resampling.LANCZOS)
+        frame = np.array(frame)
+        if any_identity_mask:
+            return (frame, frame, identity_mask)
         if any_mask:
-            if any_identity_mask:
-                mask = np.full( (height, width, 3), 0, dtype= np.uint8)
+            mask = Image.fromarray(mask_video[frame_idx].cpu().numpy()) #.asnumpy()
+            if fit_crop:
+                mask = rescale_and_crop(mask, width, height)
             else:
-                mask = Image.fromarray(mask_video[frame_idx].cpu().numpy()) #.asnumpy()
-                if fit_crop:
-                    mask = rescale_and_crop(mask, width, height)
-                else:
-                    mask = mask.resize((width, height), resample=Image.Resampling.LANCZOS) 
-                mask = np.array(mask)
+                mask = mask.resize((width, height), resample=Image.Resampling.LANCZOS)
+            mask = np.array(mask)
 
             if len(mask.shape) == 3 and mask.shape[2] == 3:
                 mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
             _, mask = cv2.threshold(mask, 127.5, 255, cv2.THRESH_BINARY)
-            original_mask = mask.copy()
+            original_mask = mask.copy() if pose_special else None
             mask = expand_or_shrink_mask(mask, expand_scale)
 
             if to_bbox and np.sum(mask == 255) > 0 : #or True 
@@ -5699,86 +5705,81 @@ def preprocess_video_with_mask(pre_video_guide, input_video_path, input_mask_pat
         else:
             return (target_frame, None, None)
     max_workers = get_default_workers()
-    proc_lists = process_images_multithread(prep_prephase, [frame_idx for frame_idx in range(num_frames)], "prephase", wrap_in_list= False, max_workers=max_workers, in_place= True)
-    proc_list, proc_list_outside, proc_mask = [None] * len(proc_lists), [None] * len(proc_lists), [None] * len(proc_lists)
-    for frame_idx, frame_group in enumerate(proc_lists): 
-        proc_list[frame_idx], proc_list_outside[frame_idx], proc_mask[frame_idx] = frame_group
-    prep_prephase = None
-    video = None
-    mask_video = None
+    # Each frame is written to the output as soon as it is ready. Processes that work frame by frame run by chunks of frames, so that
+    # the resized frames of the whole video are never all in RAM; the others (pose, depth...) see the whole video at once.
+    frame_independent = all(kind in (None, "raw", "identity", "inpaint") for kind in (process_type, process_outside_mask))
+    chunk_frames = max(16, int(max_workers) * 4) if frame_independent else num_frames
+    masked_frames = masks = None
+    for chunk_start in range(0, num_frames, chunk_frames):
+        frame_groups = process_images_multithread(prep_prephase, list(range(chunk_start, min(num_frames, chunk_start + chunk_frames))), "prephase", wrap_in_list= False, max_workers=max_workers, in_place= True)
+        proc_list, proc_list_outside, proc_mask = (list(column) for column in zip(*frame_groups))
+        frame_groups = None
+        if chunk_start + chunk_frames >= num_frames:
+            video = mask_video = None
 
-    if preproc2 != None:
-        proc_list2 = process_images_multithread(preproc2, proc_list, process_type2, max_workers=max_workers)
-        #### to be finished ...or not
-    proc_list = process_images_multithread(preproc, proc_list, process_type, max_workers=max_workers)
-    if any_mask:
-        proc_list_outside = process_images_multithread(preproc_outside, proc_list_outside, process_outside_mask, max_workers=max_workers)
-    else:
-        proc_list_outside = proc_mask = len(proc_list) * [None]
-
-    masked_frames = []
-    masks = []
-    for frame_no, (processed_img, processed_img_outside, mask) in enumerate(zip(proc_list, proc_list_outside, proc_mask)):
-        if isinstance(processed_img, (list, tuple)):
-            processed_img = np.full((height, width, 3), processed_img, dtype=np.uint8)
-        if isinstance(processed_img_outside, (list, tuple)):
-            processed_img_outside = np.full((height, width, 3), processed_img_outside, dtype=np.uint8)
-        if any_mask :
-            if process_type == "pose_align":
-                masked_frame = processed_img
-                mask = np.full_like(mask, 0)
-            else:
-                masked_frame = np.where(mask[..., None], processed_img, processed_img_outside)
-            if process_outside_mask != None:
-                mask = np.full_like(mask, 255)
-            mask = torch.from_numpy(mask)
-            if RGB_Mask:
-                mask =  mask.unsqueeze(-1).repeat(1,1,3)
-            if outpainting_dims != None:
-                full_frame= torch.full( (final_height, final_width, mask.shape[-1]), 255, dtype= torch.uint8, device= mask.device)
-                full_frame[margin_top:margin_top+height, margin_left:margin_left+width] = mask
-                mask = full_frame 
-            masks.append(mask[:, :, 0:1].clone())
+        proc_list = process_images_multithread(preproc, proc_list, process_type, max_workers=max_workers)
+        if any_mask:
+            proc_list_outside = process_images_multithread(preproc_outside, proc_list_outside, process_outside_mask, max_workers=max_workers)
         else:
-            masked_frame = processed_img
+            proc_list_outside = proc_mask = len(proc_list) * [None]
 
-        if isinstance(masked_frame, (int, float, np.integer)) or (isinstance(masked_frame, (list, tuple)) and len(masked_frame) == 3):
-            masked_frame= np.full( (height, width, 3), inpaint_color_np, dtype= np.uint8)
+        for frame_no, (processed_img, processed_img_outside, mask) in enumerate(zip(proc_list, proc_list_outside, proc_mask)):
+            proc_list[frame_no] = proc_list_outside[frame_no] = proc_mask[frame_no] = None
+            if isinstance(processed_img, (list, tuple)):
+                processed_img = np.full((height, width, 3), processed_img, dtype=np.uint8)
+            if isinstance(processed_img_outside, (list, tuple)):
+                processed_img_outside = np.full((height, width, 3), processed_img_outside, dtype=np.uint8)
+            if any_mask :
+                if process_type == "pose_align":
+                    masked_frame = processed_img
+                    mask = np.full_like(mask, 0)
+                else:
+                    masked_frame = processed_img_outside if mask is identity_mask else np.where(mask[..., None], processed_img, processed_img_outside)
+                if process_outside_mask != None:
+                    mask = np.full_like(mask, 255)
+                mask = torch.from_numpy(mask)
+                if outpainting_dims != None:
+                    full_frame= torch.full( (final_height, final_width), 255, dtype= torch.uint8, device=mask.device)
+                    full_frame[margin_top:margin_top+height, margin_left:margin_left+width] = mask
+                    mask = full_frame
+            else:
+                masked_frame = processed_img
 
-        masked_frame = torch.from_numpy(masked_frame)
-        if masked_frame.shape[-1] == 1:
-            masked_frame =  masked_frame.repeat(1,1,3).to(torch.uint8)
+            if isinstance(masked_frame, (int, float, np.integer)) or (isinstance(masked_frame, (list, tuple)) and len(masked_frame) == 3):
+                masked_frame= np.full( (height, width, 3), inpaint_color_np, dtype= np.uint8)
 
-        if outpainting_dims != None:
-            color = inpaint_color.to(masked_frame.device).view(1, 1, 3)
-            if masked_frame.shape[-1] == 4:
-                color = torch.cat([color, color.new_full((1, 1, 1), 255)], dim=-1)
-            full_frame = color.expand(final_height, final_width, masked_frame.shape[-1]).clone()
-            full_frame[margin_top:margin_top+height, margin_left:margin_left+width] = masked_frame
-            masked_frame = full_frame 
+            masked_frame = torch.from_numpy(masked_frame)
+            if masked_frame.shape[-1] == 1:
+                masked_frame =  masked_frame.repeat(1,1,3).to(torch.uint8)
 
-        masked_frames.append(masked_frame)
-        proc_list[frame_no] = proc_list_outside[frame_no] = proc_mask[frame_no] = None
+            if outpainting_dims != None:
+                color = inpaint_color.to(masked_frame.device).view(1, 1, 3)
+                if masked_frame.shape[-1] == 4:
+                    color = torch.cat([color, color.new_full((1, 1, 1), 255)], dim=-1)
+                full_frame = color.expand(final_height, final_width, masked_frame.shape[-1]).clone()
+                full_frame[margin_top:margin_top+height, margin_left:margin_left+width] = masked_frame
+                masked_frame = full_frame
 
+            if masked_frames is None: # frames stored one after the other (T, H, W, C) and returned as (C, T, H, W), the layout of the former stack
+                masked_frames = torch.empty((pad_frames + num_frames, *masked_frame.shape), dtype=torch.uint8 if uint8_output else torch.float32, device="cpu")
+                masks = torch.empty(masked_frames.shape[:3], dtype=masked_frames.dtype, device="cpu") if any_mask else None
+            masked_frames[pad_frames + chunk_start + frame_no].copy_(masked_frame)
+            if any_mask:
+                masks[pad_frames + chunk_start + frame_no].copy_(mask)
+        proc_list = proc_list_outside = proc_mask = processed_img = processed_img_outside = masked_frame = mask = full_frame = None
 
-    # if args.save_masks:
-    #     from preprocessing.dwpose.pose import save_one_video
-    #     saved_masked_frames = [mask.cpu().numpy() for mask in masked_frames ]
-    #     save_one_video(f"masked_frames{'' if proc_no==1 else str(proc_no)}.mp4", saved_masked_frames, fps=target_fps, quality=8, macro_block_size=None)
-    #     if any_mask:
-    #         saved_masks = [mask.cpu().numpy() for mask in masks ]
-    #         save_one_video("masks.mp4", saved_masks, fps=target_fps, quality=8, macro_block_size=None)
     preproc = None
     preproc_outside = None
     gc.collect()
     torch.cuda.empty_cache()
-    if pad_frames > 0:
-        masked_frames = masked_frames[0] * pad_frames + masked_frames
-        if any_mask: masked_frames = masks[0] * pad_frames + masks
-    masked_frames = torch.stack(masked_frames).permute(-1,0,1,2).float().div_(127.5).sub_(1.)
-    masks = torch.stack(masks).permute(-1,0,1,2).float().div_(255) if any_mask else None
+    if pad_frames > 0: # the frames before the start of the video repeat its first frame
+        masked_frames[:pad_frames] = masked_frames[pad_frames:pad_frames + 1]
+        if any_mask: masks[:pad_frames] = masks[pad_frames:pad_frames + 1]
+    if not uint8_output:
+        masked_frames.div_(127.5).sub_(1.)
+        if any_mask: masks.div_(255)
 
-    return masked_frames, masks
+    return masked_frames.permute(3, 0, 1, 2), masks.unsqueeze(0) if any_mask else None
 
 def preprocess_video(height, width, video_in, max_frames, start_frame=0, fit_canvas = None, fit_crop = False, target_fps = 16, block_size = 16, preserve_hdr = False):
 
@@ -5913,9 +5914,6 @@ def perform_temporal_upsampling(sample, previous_last_frame, temporal_upsampling
 
 def perform_spatial_upsampling(sample, spatial_upsampling, seed=0, flashvsr_continue_cache=None, return_flashvsr_continue_cache=False, vae_tile_size=None, still_image=False, abort_callback=None, progress_callback=None, fps=24.0, frame_offset=0, prompt="", negative_prompt="", audio_waveform=None, audio_sample_rate=0, source_audio_path=None, reference_images=None, image_refs_relative_size=100.0, spatial_upsampler_prompt="", spatial_upsampler_reference_images=None, spatial_upsampler_param=None, spatial_upsampler_param2=None, spatial_upsampler_parameters=None):
     wait_for_model_unload()
-    if upsampler_api.is_vae_upsampling(spatial_upsampling):
-        sample = upsampler_api.post_model_process_vae_upsampling(sample, spatial_upsampling)
-        return (sample, None) if return_flashvsr_continue_cache else sample
     edit_upsampler = upsampler_api.find_postprocessing_upsampler(spatial_upsampling)
     if edit_upsampler is not None:
         parameter_values = dict(spatial_upsampler_parameters or {})
@@ -6827,8 +6825,8 @@ def custom_preprocess_video_with_mask(model_handler, base_model_type, pre_video_
     model_def = model_def or {}
     raw_custom_preprocessor_inputs = model_def.get("custom_preprocessor_raw_inputs", False)
     video_guide = get_resampled_video(video_guide, start_frame, max_frames, target_fps)
-    if not raw_custom_preprocessor_inputs:
-        video_guide = video_guide.permute(-1, 0, 1, 2) / 127.5 - 1.
+    if not raw_custom_preprocessor_inputs: # in place: one float copy of the video, the values of the former / 127.5 - 1.
+        video_guide = video_guide.permute(-1, 0, 1, 2).float().div_(127.5).sub_(1.)
     pose_mask = None
     if video_mask is not None:
         video_mask = get_resampled_video(video_mask, start_frame, max_frames, target_fps)
@@ -6843,7 +6841,7 @@ def custom_preprocess_video_with_mask(model_handler, base_model_type, pre_video_
         def process_mask(idx):
             return torch.from_numpy(prepare_binary_mask_frame(pose_mask[0, idx] * 255, tgt_h, tgt_w, expand_scale=expand_scale, invert=invert_mask))
         pose_mask = torch.stack(process_images_multithread(process_mask, list(range(pose_mask.shape[1])), "prephase", wrap_in_list=False, max_workers=max_workers, in_place=False)).unsqueeze(0)
-        video_guide = video_guide * pose_mask + (-1) * (1-pose_mask)
+        video_guide = video_guide.mul_(pose_mask).sub_(1 - pose_mask) # in place, the values of video_guide * pose_mask + (-1) * (1-pose_mask)
         video_mask = pose_mask
 
     guide_frame_count = video_guide.shape[0] if raw_custom_preprocessor_inputs else video_guide.shape[1]
@@ -7308,6 +7306,9 @@ def generate_media(
     fantasy = base_model_type in ["fantasy"]
     multitalk = model_def.get("multitalk_class", False)
     fake_start_image = model_def.get("fake_start_image", False) and image_start is not None
+    uint8_guides = model_def.get("uint8_guides", False) # control videos and masks reach the model as uint8 (0-255), a quarter of the RAM of float ones
+    if callable(uint8_guides): # float ones for the modes where the model works on the whole float control video
+        uint8_guides = uint8_guides(video_prompt_type, audio_prompt_type, any_outpainting)
 
     if (multitalk or model_def.get("speaker_locations", False)) and ("B" in audio_prompt_type or "X" in audio_prompt_type):
         from models.wan.multitalk.multitalk import parse_speakers_locations
@@ -7911,19 +7912,19 @@ def generate_media(
                         if reference_videos:
                             guide_height, guide_width = get_reference_video_dimensions(guide_source, *image_size, model_def["reference_video_max_size"], block_size)
                             guide_fit_canvas = None
-                        video_guide_processed, video_mask_processed = preprocess_video_with_mask(ref_pose_tensor, guide_source, video_mask, height=guide_height, width=guide_width, max_frames=guide_frames_extract_count, start_frame=guide_frames_extract_start, fit_canvas=guide_fit_canvas, fit_crop=fit_crop, target_fps=fps, process_type=preprocess_type, expand_scale=mask_expand, RGB_Mask=True, negate_mask="N" in video_prompt_type, process_outside_mask=process_outside_mask, outpainting_dims=outpainting_dims, outpainting_ratio=video_guide_outpainting_ratio, proc_no=1, inpaint_color=inpaint_color, block_size=block_size, to_bbox="H" in video_prompt_type, outpainting_quantize_margins=outpainting_quantize_margins)
+                        video_guide_processed, video_mask_processed = preprocess_video_with_mask(ref_pose_tensor, guide_source, video_mask, height=guide_height, width=guide_width, max_frames=guide_frames_extract_count, start_frame=guide_frames_extract_start, fit_canvas=guide_fit_canvas, fit_crop=fit_crop, target_fps=fps, process_type=preprocess_type, expand_scale=mask_expand, negate_mask="N" in video_prompt_type, process_outside_mask=process_outside_mask, outpainting_dims=outpainting_dims, outpainting_ratio=video_guide_outpainting_ratio, proc_no=1, inpaint_color=inpaint_color, block_size=block_size, to_bbox="H" in video_prompt_type, outpainting_quantize_margins=outpainting_quantize_margins, uint8_output=uint8_guides)
                         if preprocess_video_guide2 and "+" in video_prompt_type and video_guide2 is not None:
                             guide2_height, guide2_width = image_size
                             guide2_fit_canvas = sample_fit_canvas
                             if reference_videos:
                                 guide2_height, guide2_width = get_reference_video_dimensions(video_guide2, *image_size, model_def["reference_video_max_size"], block_size)
                                 guide2_fit_canvas = None
-                            video_guide_processed2, video_mask_processed2 = preprocess_video_with_mask(None, video_guide2, None, height=guide2_height, width=guide2_width, max_frames=guide_frames_extract_count, start_frame=guide_frames_extract_start, fit_canvas=guide2_fit_canvas, fit_crop=fit_crop, target_fps=fps, process_type=preprocess_type, proc_no=2, block_size=block_size)
+                            video_guide_processed2, video_mask_processed2 = preprocess_video_with_mask(None, video_guide2, None, height=guide2_height, width=guide2_width, max_frames=guide_frames_extract_count, start_frame=guide_frames_extract_start, fit_canvas=guide2_fit_canvas, fit_crop=fit_crop, target_fps=fps, process_type=preprocess_type, proc_no=2, block_size=block_size, uint8_output=uint8_guides)
                         elif preprocess_type2 != None:
-                            video_guide_processed2, video_mask_processed2 = preprocess_video_with_mask(ref_pose_tensor, video_guide, video_mask, height=image_size[0], width = image_size[1], max_frames= guide_frames_extract_count, start_frame = guide_frames_extract_start, fit_canvas = sample_fit_canvas, fit_crop = fit_crop, target_fps = fps,  process_type = preprocess_type2, expand_scale = mask_expand, RGB_Mask = True, negate_mask = "N" in video_prompt_type, process_outside_mask = process_outside_mask, outpainting_dims = outpainting_dims, outpainting_ratio = video_guide_outpainting_ratio, proc_no =2, block_size = block_size, to_bbox = "H" in video_prompt_type, outpainting_quantize_margins = outpainting_quantize_margins)
+                            video_guide_processed2, video_mask_processed2 = preprocess_video_with_mask(ref_pose_tensor, video_guide, video_mask, height=image_size[0], width = image_size[1], max_frames= guide_frames_extract_count, start_frame = guide_frames_extract_start, fit_canvas = sample_fit_canvas, fit_crop = fit_crop, target_fps = fps,  process_type = preprocess_type2, expand_scale = mask_expand, negate_mask = "N" in video_prompt_type, process_outside_mask = process_outside_mask, outpainting_dims = outpainting_dims, outpainting_ratio = video_guide_outpainting_ratio, proc_no =2, block_size = block_size, to_bbox = "H" in video_prompt_type, outpainting_quantize_margins = outpainting_quantize_margins, uint8_output=uint8_guides)
                         if preprocess_video_guide2 and "*" in video_prompt_type and video_guide3 is not None:
                             guide3_height, guide3_width = get_reference_video_dimensions(video_guide3, *image_size, model_def["reference_video_max_size"], block_size) if reference_videos else image_size
-                            video_guide_processed3, _ = preprocess_video_with_mask(None, video_guide3, None, height=guide3_height, width=guide3_width, max_frames=guide_frames_extract_count, start_frame=guide_frames_extract_start, fit_canvas=None if reference_videos else sample_fit_canvas, fit_crop=fit_crop, target_fps=fps, process_type=preprocess_type, proc_no=3, block_size=block_size)
+                            video_guide_processed3, _ = preprocess_video_with_mask(None, video_guide3, None, height=guide3_height, width=guide3_width, max_frames=guide_frames_extract_count, start_frame=guide_frames_extract_start, fit_canvas=None if reference_videos else sample_fit_canvas, fit_crop=fit_crop, target_fps=fps, process_type=preprocess_type, proc_no=3, block_size=block_size, uint8_output=uint8_guides)
 
                     if video_guide_processed is not None and sample_fit_canvas is not None and not reference_videos:
                         image_size = video_guide_processed.shape[-2:]
@@ -8036,11 +8037,11 @@ def generate_media(
                 if (video_guide is not None and not skip_video_guide_preprocess) or len(frames_to_inject_parsed) > 0:
                     if args.save_masks:
                         if src_video is not None: 
-                            save_video( src_video, "masked_frames.mp4", fps)
-                            if any_mask: save_video( src_mask, "masks.mp4", fps, value_range=(0, 1))
-                        if src_video2 is not None: 
-                            save_video( src_video2, "masked_frames2.mp4", fps)
-                            if any_mask: save_video( src_mask2, "masks2.mp4", fps, value_range=(0, 1))
+                            save_video( guide_to_float(src_video), "masked_frames.mp4", fps)
+                            if any_mask: save_video( guide_mask_to_float(src_mask), "masks.mp4", fps, value_range=(0, 1))
+                        if src_video2 is not None:
+                            save_video( guide_to_float(src_video2), "masked_frames2.mp4", fps)
+                            if any_mask: save_video( guide_mask_to_float(src_mask2), "masks2.mp4", fps, value_range=(0, 1))
                 if video_guide is not None and not skip_video_guide_preprocess:
                     preview_frame_no = 0 if extract_guide_from_window_start or model_def.get("dont_cat_preguide", False) or sparse_video_image is not None else (guide_start_frame - window_start_frame) 
                     if src_video is not None:
@@ -8069,6 +8070,9 @@ def generate_media(
                 new_inputs= locals()
                 new_inputs.update(refresh_preview)
                 update_task_thumbnails(task, new_inputs)
+                # locals() is this frame's own dict (Python 3.11-3.12): kept in a local, the next locals() call would store the dict in itself
+                # and the reference cycle would keep every local, the generated video included, until a garbage collection
+                new_inputs = None
                 send_cmd("output")
 
             if window_no ==  1:                
@@ -8332,20 +8336,21 @@ def generate_media(
                     post_decode_pre_trim = samples.get("post_decode_pre_trim", 0) 
                     samples = samples.get("x", None)
 
-                if samples is not None:
-                    samples = samples.to("cpu")
+                if samples is not None and (audio_only or is_image or sample_is_hdr):
+                    samples = samples.to("cpu") # a video stays where it was decoded until it is converted to uint8 below, the RAM only gets the uint8 frames
   
             clear_gen_cache()
             offloadobj.unload_all()
             gc.collect()
             torch.cuda.empty_cache()
+            ram_debug_mark("output processing")
 
             if samples == None:
                 abort = True
                 state["prompt"] = ""
                 send_cmd("output")  
             else:
-                sample = samples.cpu()
+                sample = samples
                 samples = None
                 stop_current_sample = stop_sample_scheduled or (not (is_image or audio_only) and sample.shape[1] < current_video_length)
                 # if True: # for testing
@@ -8376,7 +8381,7 @@ def generate_media(
                     else:
                         pre_audio_guide, pre_audio_guide_sample_rate = None, 0
 
-                    pre_video_guide = sample[:, -next_overlap_frames:].clone() if next_overlap_frames > 0 else None if scheduler_active else sample[:, max_source_video_frames:].clone()
+                    pre_video_guide = sample[:, -next_overlap_frames:].to("cpu", copy=True) if next_overlap_frames > 0 else None if scheduler_active else sample[:, max_source_video_frames:].to("cpu", copy=True)
                     pre_video_guide_is_hdr = sample_is_hdr
                     if pre_video_guide is not None and pre_video_guide.dtype == torch.uint8:
                         pre_video_guide =  pre_video_guide.float().div_(127.5).sub_(1.0)
@@ -8390,7 +8395,10 @@ def generate_media(
                             generated_audio = truncate_audio(generated_audio, trim_first_frames, 0, fps, output_audio_sampling_rate)
                 if not (audio_only or is_image):
                     if not sample_is_hdr:
-                        sample = convert_video_tensor_to_uint8_chunked(sample)
+                        sample = convert_video_tensor_to_uint8_chunked(sample, max_buffer_mb=64, output_device="cpu")
+                if upsampler_api.has_post_model_process_vae_upsampling(spatial_upsampling): # VAE upsamplers reach their final size before source frames are joined and frames are interpolated
+                    send_cmd("progress", [0, merge_status_context(status, upsampler_api.method_progress_label(spatial_upsampling))])
+                    sample = upsampler_api.post_model_process_vae_upsampling(sample, spatial_upsampling)
 
                 if prefix_video != None and window_no == 1 :
                     if sample_is_hdr:
@@ -8407,11 +8415,10 @@ def generate_media(
                         elif prefix_video.dtype == torch.uint8:
                             prefix_video = prefix_video.float().div_(127.5).sub_(1.0)
                     if prefix_video.shape[1] > 1:
+                        if prefix_video.shape[-2:] != sample.shape[-2:]: # a VAE upsampler enlarged the generated frames
+                            prefix_video = resize_lanczos_spatial(prefix_video, None, size=sample.shape[-2:])
                         # remove sliding window overlapped frames at the beginning of the generation
                         sample = torch.cat([ prefix_video, sample[: , source_video_overlap_frames_count:]], dim = 1)
-                    else:
-                        # remove source video overlapped frames at the beginning of the generation if there is only a start frame
-                        sample = torch.cat([ prefix_video[:, :-source_video_overlap_frames_count], sample], dim = 1)
                     prefix_video = None
                     guide_start_frame -= source_video_overlap_frames_count 
                     if generated_audio is not None:
@@ -8442,7 +8449,7 @@ def generate_media(
                     retained_video_frames += sample.shape[1]
 
 
-                if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 and (not upsampler_api.is_vae_upsampling(spatial_upsampling) or upsampler_api.has_post_model_process_vae_upsampling(spatial_upsampling)):
+                if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 and not upsampler_api.is_vae_upsampling(spatial_upsampling):
                     spatial_status = upsampler_api.method_progress_label(spatial_upsampling)
                     send_cmd("progress", [0, merge_status_context(status, spatial_status)])
                 
@@ -8461,7 +8468,7 @@ def generate_media(
                         abort = True
                         break
 
-                if len(spatial_upsampling) > 0:
+                if len(spatial_upsampling) > 0 and not upsampler_api.is_vae_upsampling(spatial_upsampling):
                     if is_image:
                         sample = perform_image_spatial_upsampling(sample, spatial_upsampling, seed=seed, vae_tile_size=VAE_tile_size, fps=output_fps, prompt=prompt, negative_prompt=negative_prompt, spatial_upsampler_prompt=spatial_upsampler_prompt, spatial_upsampler_reference_images=spatial_upsampler_reference_images, spatial_upsampler_param=spatial_upsampler_param, spatial_upsampler_param2=spatial_upsampler_param2, spatial_upsampler_parameters=spatial_upsampler_parameters, abort_callback=lambda: media_abort_requested(gen), progress_callback=upsampler_progress)
                         flashvsr_continue_cache = None
@@ -8881,6 +8888,7 @@ def _process_tasks(state):
                     plugin_data = task.pop('plugin_data', {})
                     success = generate_media(task, send_cmd, plugin_data=plugin_data,  **filtered_params)
                     write_vram_debug_report(save_path, params.get("model_type"))
+                    write_ram_debug_report(save_path, params.get("model_type"))
 
                 except DownloadCancelled:
                     success = True
@@ -9138,6 +9146,7 @@ def process_tasks_cli(queue, state):
                     plugin_data = task.get('plugin_data', {})
                     generate_media(task, send_cmd, plugin_data=plugin_data, **filtered_params)
                     write_vram_debug_report(save_path, params.get("model_type"))
+                    write_ram_debug_report(save_path, params.get("model_type"))
                 except Exception as e:
                     print(f"\n  [ERROR] {e}")
                     traceback.print_exc()
@@ -9201,6 +9210,7 @@ def process_tasks_cli(queue, state):
             failed += 1
             notification_run.task_failed()
 
+    release_ram_cache()  # the queue is done: the RAM a next generation of the same model would have reused goes back to the system
     elapsed = time.time() - start_time
     print(f"\n{'='*50}")
     summary = f"Queue completed: {completed}/{total_tasks} tasks in {format_time(elapsed)}"

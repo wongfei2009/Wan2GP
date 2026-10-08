@@ -246,7 +246,7 @@ def _get_perc_reserved_mem_max(perc_reserved_mem_max = 0):
         perc_reserved_mem_max = float(os.getenv("perc_reserved_mem_max", 0) or 0)
 
     if perc_reserved_mem_max <= 0:             
-        perc_reserved_mem_max = 0.40 if os.name == 'nt' else 0.8
+        perc_reserved_mem_max = 0.40 if os.name == 'nt' else 0.6
     return perc_reserved_mem_max
     
 def _get_max_reservable_memory(perc_reserved_mem_max = 0):
@@ -2571,19 +2571,22 @@ def flush_torch_caches():
                 kernel32.CloseHandle(handle)
         except Exception:
             pass
-    from accelerate import init_empty_weights
-    with init_empty_weights():
-        try:
-            for _ in range(3):
-                dummy_tensor = torch.nn.Embedding(256384, 1024)
-                dummy_tensor = None    
-        except Exception:
-            pass
-        dummy_tensor = None    
+    from .allocator import ram
+    if not ram.active:  # with PyTorch's CPU allocator: large dummy allocations push it to give freed memory back
+        from accelerate import init_empty_weights
+        with init_empty_weights():
+            try:
+                for _ in range(3):
+                    dummy_tensor = torch.nn.Embedding(256384, 1024)
+                    dummy_tensor = None
+            except Exception:
+                pass
+            dummy_tensor = None
 
     if torch.cuda.is_available():
         gc.collect()
         torch.cuda.empty_cache()
+    ram.release()  # the MMGP RAM allocator's freed blocks go back to the system
 
 
 def map_state_dict(state_dict, rules):
@@ -4237,7 +4240,7 @@ class offload:
             if any_dora and any_lokr:
                 break
 
-        dtype = weight.dtype
+        dtype = submodule.__dict__.get("_mm_weight_dtype", None) or weight.dtype # cached by _mm_lora_linear_forward: a quantized weight's dtype costs a Python dispatch
         if any_dora and not any_lokr: # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
             original_bias = True
             if isinstance(submodule, QModuleMixin):
@@ -4286,11 +4289,10 @@ class offload:
 
             if active_adapters:
                 compute_dtype = result.dtype
-                if result.dtype != compute_dtype:
-                    result = result.to(compute_dtype)
-                x = x.to(compute_dtype)
-                x_2d = x.reshape(-1, x.shape[-1])
-                result_2d = result.reshape(-1, result.shape[-1])
+                if x.dtype != compute_dtype:
+                    x = x.to(compute_dtype)
+                x_2d = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
+                result_2d = result if result.dim() == 2 else result.reshape(-1, result.shape[-1])
 
                 for active_adapter in active_adapters:
                     data = loras_data.get(active_adapter + '_GPU', None)
