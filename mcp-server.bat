@@ -137,7 +137,8 @@ REM No default: an unset PROFILE means "let WanGP choose per output type".
 set "PROFILE_ARG="
 if not "%PROFILE%"=="" set "PROFILE_ARG=--profile %PROFILE%"
 
-call venv\Scripts\activate.bat
+REM uv installs into .venv\; the older pip install used venv\. Prefer .venv.
+if exist .venv\Scripts\activate.bat (call .venv\Scripts\activate.bat) else (call venv\Scripts\activate.bat)
 
 REM Make sure the outputs folder exists before serving it
 if not exist outputs mkdir outputs
