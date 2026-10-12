@@ -34,6 +34,7 @@ storage/
 samples/
 !.gitignore
 !requirements.txt
+!/profiles/prism/.gitkeep
 .DS_Store
 *DS_Store
 google/
@@ -46,8 +47,10 @@ loras/
 loras_i2v/
 tmp/
 deepy_sessions/
+/ComputeCache/
 dlss5/
 /settings/
+/user_skills/
 
 # Local engineering specifications and tests must never be committed.
 /specs/
@@ -73,3 +76,6 @@ mcp-server.env.bat
 # Third-party plugins installed via the web UI plugin manager
 plugins/wan2gp-gallery/
 plugins/wan2gp-lora-multipliers-ui/
+
+# GPL-3.0 SeedVC component, fetched on first use from github.com/deepbeepmeep/WanGP-SeedVC
+postprocessing/seedvc/

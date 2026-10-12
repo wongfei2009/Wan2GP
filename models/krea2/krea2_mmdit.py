@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+from mmgp import cuda_graphs
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -661,11 +662,12 @@ class SingleStreamDiT(nn.Module):
         combined, txtlen, imglen, freqs, mask = self._build_stream(img, context, pos, mask)
         del img, context, pos
         ref_split = txtlen + imglen - ref_len if ref_len > 0 else None
-        for block in self.blocks:
-            combined = block(combined, tvec, freqs, mask, txt_len=txtlen, NAG=NAG, neg_context=neg_context, neg_mask=neg_mask, ref_vec=ref_tvec if ref_len > 0 else None, ref_split=ref_split)
-            if getattr(self, "_interrupt", False):
-                return None
-            self.txtfusion._interrupt = getattr(self, "_interrupt", False)
+        with cuda_graphs.scope():
+            for block in self.blocks:
+                combined = block(combined, tvec, freqs, mask, txt_len=txtlen, NAG=NAG, neg_context=neg_context, neg_mask=neg_mask, ref_vec=ref_tvec if ref_len > 0 else None, ref_split=ref_split)
+                if getattr(self, "_interrupt", False):
+                    return None
+                self.txtfusion._interrupt = getattr(self, "_interrupt", False)
         if ref_len > 0:
             # References ride at the tail of the sequence: the denoised target is the front of the image span.
             target_len = imglen - ref_len if target_len is None else target_len
@@ -684,13 +686,14 @@ class SingleStreamDiT(nn.Module):
         block_ref_vec = ref_tvec if ref_len > 0 else None
         ref_split = txtlen + imglen - ref_len if ref_len > 0 else None
         uncond_ref_split = uncond_txtlen + uncond_imglen - ref_len if ref_len > 0 else None
-        for block in self.blocks:
-            combined = block(combined, tvec, freqs, mask, ref_vec=block_ref_vec, ref_split=ref_split)
-            if getattr(self, "_interrupt", False):
-                return None, None
-            uncond_combined = block(uncond_combined, tvec, uncond_freqs, uncond_mask, ref_vec=block_ref_vec, ref_split=uncond_ref_split)
-            if getattr(self, "_interrupt", False):
-                return None, None
+        with cuda_graphs.scope():
+            for block in self.blocks:
+                combined = block(combined, tvec, freqs, mask, ref_vec=block_ref_vec, ref_split=ref_split)
+                if getattr(self, "_interrupt", False):
+                    return None, None
+                uncond_combined = block(uncond_combined, tvec, uncond_freqs, uncond_mask, ref_vec=block_ref_vec, ref_split=uncond_ref_split)
+                if getattr(self, "_interrupt", False):
+                    return None, None
         if ref_len > 0:
             target_len = imglen - ref_len if target_len is None else target_len
             return self.last([combined[:, txtlen : txtlen + target_len]], t), self.last([uncond_combined[:, uncond_txtlen : uncond_txtlen + target_len]], t)
