@@ -30,7 +30,8 @@ REM mask/source, audio_guide/guide2/source, ...) -- without the flag each one
 REM fails with "Direct filesystem paths are disabled". The sanctioned
 REM alternatives (Gallery ids, the wangp_create_gallery_upload PUT-URL flow) are
 REM not what the CLI speaks. Paths arrive relative (outputs\<name>) and resolve
-REM against THIS process's CWD, i.e. the repo root -- so run the .bat from here.
+REM against THIS process's CWD, i.e. the repo root -- which is why the script
+REM cd's to its own folder first, so it can be started from anywhere.
 REM The flag also enables wangp_list_files / wangp_query_file, i.e. arbitrary
 REM server-file reads, so it widens the same no-auth exposure as the note below.
 REM
@@ -41,8 +42,10 @@ REM your firewall scope -- make sure the port is firewalled to the VPN/LAN.
 REM ---------------------------------------------------------------------------
 
 REM Bind all interfaces (like web-ui.bat's --listen) so it's reachable on the LAN/VPN.
-set MCP_HOST=0.0.0.0
-set MCP_PORT=7866
+REM Either can be preset to override: mcp-server-background.bat (the ssh-tunnel
+REM launcher) binds 127.0.0.1, so the server is reachable ONLY through the tunnel.
+if "%MCP_HOST%"=="" set MCP_HOST=0.0.0.0
+if "%MCP_PORT%"=="" set MCP_PORT=7866
 
 REM ---------------------------------------------------------------------------
 REM Memory tuning (this box: RTX 5080 16 GB VRAM, 64 GB system RAM)
@@ -136,6 +139,9 @@ if "%PERC_RESERVED%"=="" set PERC_RESERVED=0.45
 REM No default: an unset PROFILE means "let WanGP choose per output type".
 set "PROFILE_ARG="
 if not "%PROFILE%"=="" set "PROFILE_ARG=--profile %PROFILE%"
+
+REM Run from the repo root whatever the caller's CWD (see the path note above).
+cd /d "%~dp0"
 
 REM uv installs into .venv\; the older pip install used venv\. Prefer .venv.
 if exist .venv\Scripts\activate.bat (call .venv\Scripts\activate.bat) else (call venv\Scripts\activate.bat)
