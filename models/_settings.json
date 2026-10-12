@@ -93,6 +93,7 @@
 	"sliding_window_trim_first_frames": 0,
 	"RIFLEx_setting": 0,
 	"override_profile": -1,
+	"override_vram_safety": -1,
 	"override_attention": "",
 	"attention_sparsity": 1.0,
 	"output_filename": "",

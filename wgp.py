@@ -3431,6 +3431,9 @@ default_profile_image = force_profile_no if force_profile_no >= 0 else server_co
 default_profile_audio = force_profile_no if force_profile_no >= 0 else server_config["audio_profile"]
 default_profile = default_profile_video
 loaded_profile = force_profile_no = -1
+# Fork: the VRAM safety coefficient the loaded model was profiled with, so a job's
+# override_vram_safety can trigger a reload just as override_profile does.
+loaded_vram_safety = None
 compile = server_config.get("compile", "")
 if args.compile:
     compile="transformer"
@@ -4078,8 +4081,19 @@ def ensure_prompt_enhancer_loaded(override_profile=-1, progress=None, send_cmd=N
     return prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer
 
 @controlled_model_loading
-def load_models(model_type, override_profile = -1, output_type="video", config_id = None, runtime_model_type=None, track_as_main=True, gen=None, loading_callback=None, **model_kwargs):
-    global transformer_type, loaded_profile, loaded_config
+def compute_vram_safety(override_vram_safety=None):
+    # Fork: a job may override --vram-safety-coefficient (wangp-cli --vram-safety).
+    # None / "" / -1 mean "use the launch value". Only takes effect on a model
+    # (re)load, which generate_media forces whenever the value changes.
+    if override_vram_safety in (None, "", -1):
+        return args.vram_safety_coefficient
+    value = float(override_vram_safety)
+    if not 0 < value <= 1:
+        raise ValueError(f"override_vram_safety must be in (0, 1], got {override_vram_safety!r}")
+    return value
+
+def load_models(model_type, override_profile = -1, output_type="video", config_id = None, runtime_model_type=None, track_as_main=True, gen=None, loading_callback=None, override_vram_safety=None, **model_kwargs):
+    global transformer_type, loaded_profile, loaded_config, loaded_vram_safety
     ram_debug_mark(f"loading {model_type}")
     def _load_models_info(message):
         if int(verbose_level) > 0:
@@ -4120,7 +4134,8 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
     if quantizeTransformer or "quanto" in model_filename:
         transformer_dtype = torch.bfloat16 if "bf16" in model_filename or "BF16" in model_filename else transformer_dtype
         transformer_dtype = torch.float16 if "fp16" in model_filename or"FP16" in model_filename else transformer_dtype
-    vram_safety_coefficient = args.vram_safety_coefficient 
+    vram_safety_coefficient = compute_vram_safety(override_vram_safety)
+    print(f"VRAM safety coefficient: {vram_safety_coefficient}" + (" (job override)" if override_vram_safety not in (None, "", -1) else " (launch value)"))
     model_file_list = [model_filename]
     model_type_list = [model_type]
     source_type_list = [0]
@@ -4244,6 +4259,7 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
         transformer_type = model_type
         loaded_profile = profile
         loaded_config = config_id or ""
+        loaded_vram_safety = vram_safety_coefficient
     return wan_model, offloadobj 
 
 if not "P" in preload_model_policy:
@@ -7000,6 +7016,7 @@ def generate_media(
     mode,
     plugin_data=None,
     spatial_upsampler_parameters=None,
+    override_vram_safety=None,
 ):
     wait_for_model_unload()
 
@@ -7113,7 +7130,8 @@ def generate_media(
         model_kwargs.update(upsampler_api.model_load_kwargs_for_vae_upsampling(spatial_upsampling, base_model_type, model_def, image_mode))
     output_type = get_profile_type_for_model(model_type, image_mode)
     profile = compute_profile(override_profile, output_type)
-    if model_type != transformer_type or reload_needed or profile != loaded_profile or config != loaded_config:
+    vram_safety = compute_vram_safety(override_vram_safety)
+    if model_type != transformer_type or reload_needed or profile != loaded_profile or config != loaded_config or vram_safety != loaded_vram_safety:
         release_model()
         loading_model_name = get_model_name(model_type)
         send_cmd("status", f"Loading Model {loading_model_name}...")
@@ -7124,7 +7142,7 @@ def generate_media(
             send_cmd("progress", [(completed, total), title, total, "blocks" if phase == "Pinning" else "phases"])
 
         try:
-            wan_model, offloadobj = load_models(model_type, override_profile, output_type=output_type, config_id=config, gen=gen, loading_callback=offload.LoadingCallback(lambda: gen.get("abort", False), loading_progress), **model_kwargs)
+            wan_model, offloadobj = load_models(model_type, override_profile, output_type=output_type, config_id=config, gen=gen, loading_callback=offload.LoadingCallback(lambda: gen.get("abort", False), loading_progress), override_vram_safety=override_vram_safety, **model_kwargs)
         except offload.LoadingCancelled as error:
             traceback.clear_frames(error.__traceback__)
             gc.collect()
