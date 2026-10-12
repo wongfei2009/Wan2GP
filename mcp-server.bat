@@ -160,10 +160,24 @@ set "PROFILE_ARG="
 if not "%PROFILE%"=="" set "PROFILE_ARG=--profile %PROFILE%"
 
 REM uv installs into .venv\; the older pip install used venv\. Prefer .venv.
+REM ---------------------------------------------------------------------------
+REM RES_BUDGET (fork, opt-in). WanGP v18 caps every API job at the model's
+REM resolution_budget (1920x1088 unless the model declares one) -- a guard for
+REM LLM agents ("UI overrides are separate"). The cap stays ON by default.
+REM For a launch serving only a trusted client that picks sizes deliberately
+REM (the wangp CLI), set "RES_BUDGET=off" in mcp-server.env.bat, or from the
+REM Mac: RES_BUDGET=off windows/windows.sh restart. That passes
+REM --mcp-no-resolution-budget: only the MAXIMUM is skipped, minimum and locked
+REM resolutions still apply, and the log says so at startup. Oversized jobs
+REM then risk OOM or very slow runs instead of a validation error.
+REM ---------------------------------------------------------------------------
+set "RES_BUDGET_ARG="
+if /i "%RES_BUDGET%"=="off" set "RES_BUDGET_ARG=--mcp-no-resolution-budget"
+
 if exist .venv\Scripts\activate.bat (call .venv\Scripts\activate.bat) else (call venv\Scripts\activate.bat)
 
 REM Make sure the outputs folder exists before serving it
 if not exist outputs mkdir outputs
 
 REM Run the MCP server (which also serves /files/*), all output to the log
-python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --mcp-allow-read-file-system --mcp-api-version 1 %PROFILE_ARG% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED% > mcp-server.log 2>&1
+python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --mcp-allow-read-file-system --mcp-api-version 1 %RES_BUDGET_ARG% %PROFILE_ARG% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED% > mcp-server.log 2>&1

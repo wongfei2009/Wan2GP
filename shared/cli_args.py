@@ -88,6 +88,7 @@ def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     add("--mcp-async", action="store_true", help="Allow asynchronous generation/post-processing in MCP API v2/v2.1; disabled by default")
     add("--mcp-console-output", action="store_true", help="Mirror WanGP stdout/stderr while serving MCP requests")
     add("--mcp-allow-read-file-system", action="store_true", help="Allow MCP agents to reference arbitrary server filesystem paths; disabled by default")
+    add("--mcp-no-resolution-budget", action="store_true", help="Skip the per-model maximum resolution budget for API/agent jobs (minimum and locked resolutions still apply); for trusted clients that pick sizes deliberately. Disabled by default")
     add("--dry-run", action="store_true", help="Validate file without generating (use with --process)")
     add("--output-dir", type=str, default="", help="Override output directory for CLI processing (use with --process)")
     add("--refresh-catalog", action="store_true", help="Refresh local plugin metadata for installed external plugins")

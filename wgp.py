@@ -2614,6 +2614,9 @@ attention_modes_supported = get_supported_attention_modes()
 override_attention_modes_installed = get_override_attention_modes()
 override_attention_modes_supported = get_supported_override_attention_modes()
 args = parse_wgp_args(CONFIG_FILENAME)
+if args.mcp_no_resolution_budget:
+    resolution_utils.ENFORCE_AGENT_RESOLUTION_BUDGET = False
+    print("[MCP] Resolution budget for API jobs: OFF (--mcp-no-resolution-budget); minimum and locked resolutions still apply")
 migrate_loras_layout()
 
 gpu_major, gpu_minor = torch.cuda.get_device_capability(args.gpu if len(args.gpu) > 0 else None)

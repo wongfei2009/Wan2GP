@@ -10,6 +10,8 @@ from shared.match_archi import match_nvidia_architecture
 RESOLUTION_FILE = "resolutions.json"
 # Include the block-aligned 1080p presets (1920x1088).
 DEFAULT_RESOLUTION_BUDGET = "1920x1088"
+# Fork: wgp.py turns this off for --mcp-no-resolution-budget; only the maximum is skipped.
+ENFORCE_AGENT_RESOLUTION_BUDGET = True
 
 DEFAULT_RESOLUTION_CHOICES_4K = [
     # 16.8 MP
@@ -505,6 +507,8 @@ def validate_agent_resolution(model_def, resolution, guidance_phases=1, video_pr
     minimum = resolution_pixels(model_def.get("resolution_min")) or 0
     mode = resolution_mode(model_def, guidance_phases, video_prompt_type)
     maximum = available_resolution_budgets(model_def).get(mode, resolution_budget(model_def)["default"])
+    if not ENFORCE_AGENT_RESOLUTION_BUDGET:
+        maximum = math.inf
     if pixels < minimum or pixels > maximum:
         assessment = assess_resolution(model_def, resolution, guidance_phases, video_prompt_type)
         hint = f" Use settings {json.dumps(assessment['settings'])} for this size." if assessment.get("settings") else " Choose another resolution or model."
