@@ -60,7 +60,7 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\][^\x1b\x07]*(?:\x1b\\|\x07)|\x1b\[[0-9;?]*[
 _TRANSPORT_LOG_SOURCE_RE = re.compile(r"site-packages[\\/](?:mcp|uvicorn|starlette|sse_starlette)[\\/]")
 # The same records without rich, and rich's wrapped continuation of them.
 _TRANSPORT_LOG_TEXT_RE = re.compile(
-    r"Processing request of type \w+|Terminating session:|^(?:[A-Z]\w*(?:Request|Notification))$"
+    r"Processing request of type\b|Terminating session:|^(?:[A-Z]\w*(?:Request|Notification))$"
 )
 _TIMING_LOG = logging.getLogger("wangp.mcp.timing")
 _REQUEST_ID = contextvars.ContextVar("wangp_mcp_request_id", default="inprocess")
