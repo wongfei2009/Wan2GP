@@ -2,7 +2,21 @@
 REM ---------------------------------------------------------------------------
 REM WanGP MCP server launcher
 REM
-REM ONE process serves everything, bound to all interfaces (0.0.0.0):
+REM Written for a box reached over SSH, with port 7866 CLOSED in the firewall.
+REM It is not meant to be double-clicked; wangp-cli's windows/windows.sh runs it:
+REM   - as an interactive scheduled task (WanGP-MCP) in the logged-on desktop
+REM     session, because a process started inside an ssh session is killed
+REM     when that session ends:
+REM       schtasks /create /f /tn WanGP-MCP /sc once /st 00:00 /it /tr "<this file>"
+REM       schtasks /run /tn WanGP-MCP
+REM   - bound to 127.0.0.1 by default, so ONLY an ssh tunnel reaches it
+REM     (ssh -L 17867:127.0.0.1:7866 ...);
+REM   - with all output in mcp-server.log (overwritten each start; *.log is
+REM     git-ignored) instead of a console window, so it can be read over ssh;
+REM   - with per-launch knobs from mcp-server.env.bat when present (git-ignored;
+REM     windows.sh writes it), e.g.  set "VRAM_SAFETY=0.5"
+REM
+REM ONE process serves everything:
 REM   - MCP (Streamable HTTP):       http://%MCP_HOST%:%MCP_PORT%/mcp
 REM   - download generated media:    GET  http://%MCP_HOST%:%MCP_PORT%/files/<relpath>
 REM   - list a directory:            GET  http://%MCP_HOST%:%MCP_PORT%/files/  (plain text)
@@ -37,14 +51,18 @@ REM server-file reads, so it widens the same no-auth exposure as the note below.
 REM
 REM NOTE: No endpoint has authentication, including file UPLOADS -- anyone who
 REM can reach this port can read outputs and write files into outputs\.
-REM Binding 0.0.0.0 listens on ALL interfaces, so exposure is limited ONLY by
-REM your firewall scope -- make sure the port is firewalled to the VPN/LAN.
+REM That is why the default bind is 127.0.0.1. Setting MCP_HOST=0.0.0.0 (in
+REM mcp-server.env.bat) listens on ALL interfaces for direct LAN access, and
+REM then exposure is limited ONLY by your firewall scope.
 REM ---------------------------------------------------------------------------
 
-REM Bind all interfaces (like web-ui.bat's --listen) so it's reachable on the LAN/VPN.
-REM Either can be preset to override: mcp-server-background.bat (the ssh-tunnel
-REM launcher) binds 127.0.0.1, so the server is reachable ONLY through the tunnel.
-if "%MCP_HOST%"=="" set MCP_HOST=0.0.0.0
+REM Run from the repo root whatever the caller's CWD (see the path note above).
+cd /d "%~dp0"
+
+REM Per-launch knobs first, so they win over every default below.
+if exist mcp-server.env.bat call mcp-server.env.bat
+
+if "%MCP_HOST%"=="" set MCP_HOST=127.0.0.1
 if "%MCP_PORT%"=="" set MCP_PORT=7866
 
 REM ---------------------------------------------------------------------------
@@ -104,11 +122,12 @@ REM                  legacy decoder, so prefer per-launch over permanent.
 REM
 REM Change one at a time so it stays clear which one moved the needle.
 REM
-REM Each can be overridden for a single launch without editing this file.
-REM Quote the assignment -- `set VAR=0.35 && ...` captures the space before the
-REM `&&` into the value:
-REM   set "VRAM_SAFETY=0.35" && mcp-server.bat
-REM ...or just set it on its own line first, then run the script.
+REM Each can be overridden for a single launch without editing this file. From
+REM the Mac:  VRAM_SAFETY=0.35 windows/windows.sh restart  (wangp-cli), which
+REM writes mcp-server.env.bat; on the box, put the same lines in that file. Quote
+REM the assignment -- `set VAR=0.35 && ...` captures the space before the `&&`
+REM into the value:
+REM   set "VRAM_SAFETY=0.35"
 REM
 REM ###########################################################################
 REM #  DEFAULT IS 0.8 (wgp.py's own default) -- TUNED FOR AUDIO, *NOT* VIDEO. #
@@ -120,7 +139,7 @@ REM #                                          then 0.3, then PROFILE=5       #
 REM #    (PROFILE=5 re-flattens audio to the legacy LM decoder -- see above)  #
 REM #    MiniMax Music 3 / audio ............. 0.8 (the default) -- see below #
 REM #                                                                         #
-REM #  e.g.  set "VRAM_SAFETY=0.5" && mcp-server.bat                          #
+REM #  e.g.  VRAM_SAFETY=0.5 windows/windows.sh restart                       #
 REM ###########################################################################
 REM
 REM Why 0.8 for MiniMax Music 3: its bottleneck is an autoregressive Qwen3 stage
@@ -140,14 +159,11 @@ REM No default: an unset PROFILE means "let WanGP choose per output type".
 set "PROFILE_ARG="
 if not "%PROFILE%"=="" set "PROFILE_ARG=--profile %PROFILE%"
 
-REM Run from the repo root whatever the caller's CWD (see the path note above).
-cd /d "%~dp0"
-
 REM uv installs into .venv\; the older pip install used venv\. Prefer .venv.
 if exist .venv\Scripts\activate.bat (call .venv\Scripts\activate.bat) else (call venv\Scripts\activate.bat)
 
 REM Make sure the outputs folder exists before serving it
 if not exist outputs mkdir outputs
 
-REM Run the MCP server (which also serves /files/*) in the foreground
-python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --mcp-allow-read-file-system --mcp-api-version 1 %PROFILE_ARG% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED%
+REM Run the MCP server (which also serves /files/*), all output to the log
+python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --mcp-allow-read-file-system --mcp-api-version 1 %PROFILE_ARG% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED% > mcp-server.log 2>&1

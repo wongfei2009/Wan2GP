@@ -67,7 +67,7 @@ venv/
 # Startup log (not caught by *.log)
 startup_log.txt
 
-# Per-launch knobs for mcp-server-background.bat (written by wangp-cli's windows.sh)
+# Per-launch knobs for mcp-server.bat (written by wangp-cli's windows.sh)
 mcp-server.env.bat
 
 # Third-party plugins installed via the web UI plugin manager
