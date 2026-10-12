@@ -2293,6 +2293,10 @@ def build_webui_server(service, args):
     for tool in server._tool_manager.list_tools():  # an agent waiting for its job must not block the others
         if not tool.is_async:
             tool.fn, tool.is_async = _in_thread(tool.fn), True
+    # Fork-only: the same /files routes as build_server, so the wangp CLI can
+    # upload and download against the Web UI process too (see mcp_files.py).
+    from shared.mcp_files import register_file_routes
+    register_file_routes(server, Path(getattr(args, "output_dir", "") or config.get("save_path") or "outputs"))
     app = server.sse_app() if transport == "sse" else server.streamable_http_app()
     app = app if oauth is None else oauth.wrap(app)
 

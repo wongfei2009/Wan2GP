@@ -179,5 +179,20 @@ if exist .venv\Scripts\activate.bat (call .venv\Scripts\activate.bat) else (call
 REM Make sure the outputs folder exists before serving it
 if not exist outputs mkdir outputs
 
+REM UI=1 (fork): run the Gradio Web UI WITH the MCP server inside the same
+REM process (--mcp-webui), instead of MCP alone. CLI jobs then join the UI's
+REM queue and gallery, so a .glb made with `wangp generate` opens in the
+REM gallery's 3D viewer: orbit it, and the camera button adds a snapshot of
+REM that view to the image gallery (saved in outputs\, so the CLI can fetch
+REM it). The /files routes are registered on this path too (fork-only).
+REM BOTH listeners are pinned to 127.0.0.1 here, whatever MCP_HOST says: the
+REM UI has no authentication, so it is reachable ONLY through the ssh tunnel.
+REM From the Mac: UI=1 windows/windows.sh restart, then open
+REM http://localhost:17860 (windows.sh tunnels 17860 -> 127.0.0.1:7860).
+if /i "%UI%"=="1" (
+  python wgp.py --mcp-webui --mcp-transport streamable-http --mcp-host 127.0.0.1 --mcp-port %MCP_PORT% --server-name 127.0.0.1 --server-port 7860 --mcp-allow-read-file-system --mcp-api-version 1 %RES_BUDGET_ARG% %PROFILE_ARG% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED% > mcp-server.log 2>&1
+  goto :eof
+)
+
 REM Run the MCP server (which also serves /files/*), all output to the log
 python wgp.py --mcp --mcp-transport streamable-http --mcp-host %MCP_HOST% --mcp-port %MCP_PORT% --mcp-console-output --mcp-allow-read-file-system --mcp-api-version 1 %RES_BUDGET_ARG% %PROFILE_ARG% --vram-safety-coefficient %VRAM_SAFETY% --perc-reserved-mem-max %PERC_RESERVED% > mcp-server.log 2>&1
