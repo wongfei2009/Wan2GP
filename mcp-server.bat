@@ -176,6 +176,13 @@ if /i "%RES_BUDGET%"=="off" set "RES_BUDGET_ARG=--mcp-no-resolution-budget"
 
 if exist .venv\Scripts\activate.bat (call .venv\Scripts\activate.bat) else (call venv\Scripts\activate.bat)
 
+REM stdout/stderr go to mcp-server.log, and a redirected Python stream uses the
+REM ANSI code page (cp1252), not the console's Unicode path -- so any print of a
+REM non-Latin prompt raised "'charmap' codec can't encode characters" and failed
+REM the job AFTER generation (seen on a Cantonese Fish Audio script). Only the
+REM std streams change; file I/O defaults are untouched (that would be PYTHONUTF8).
+set PYTHONIOENCODING=utf-8
+
 REM Make sure the outputs folder exists before serving it
 if not exist outputs mkdir outputs
 
