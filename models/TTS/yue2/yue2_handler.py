@@ -286,7 +286,7 @@ class family_handler:
             # built-in AR LoRA. SongRequest already accepts lyrics="" -- only
             # wgp.py's generic "Prompt cannot be empty" guard stood in the way,
             # so opt out of it.
-            "allow_empty_prompt": True,
+            "prompt_optional": True,
             "any_audio_prompt": True, "audio_prompt_choices": True, "audio_guide_label": "Source Song (Music to Transcribe)",
             "audio_prompt_type_sources": {
                 "selection": ["0", "1", "12", "A", "A2"],
@@ -317,7 +317,7 @@ class family_handler:
                 "specialities": [{"name": "hum to song", "aliases": ["humming to song"], "description": "Create a song from a hummed melody, lyrics and music style."}],
             })
             definition.pop("custom_guide")
-            definition.pop("allow_empty_prompt")
+            definition.pop("prompt_optional")
         from models.help_shared import merge_help, specialities
         return merge_help(definition, {"specialities": specialities("music generation")})
 
