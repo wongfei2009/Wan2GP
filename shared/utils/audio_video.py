@@ -48,6 +48,9 @@ def _prepare_audio_array(audio_data):
         audio_data = audio_data.detach().cpu().float().numpy()
     else:
         audio_data = np.asarray(audio_data, dtype=np.float32)
+    if audio_data.ndim == 2 and audio_data.size == 0:
+        # Empty tracks have zero frames; the other axis retains the channel count.
+        return audio_data.reshape(0, max(audio_data.shape))
     if audio_data.ndim == 2 and audio_data.shape[0] <= 8 and audio_data.shape[1] > audio_data.shape[0]:
         audio_data = audio_data.T
     return audio_data
@@ -324,14 +327,12 @@ def get_mp4_audio_codec_settings(codec_key):
     return settings.get(codec_key, settings["aac_128"])
 
 
-def get_video_audio_encode_args(codec_key):
-    settings = get_mp4_audio_codec_settings(codec_key)
-    args = ["-c:a", settings["codec"]]
-    if settings.get("bitrate"):
-        args += ["-b:a", settings["bitrate"]]
-    if settings.get("sample_fmt"):
-        args += ["-sample_fmt", settings["sample_fmt"]]
-    return args
+def get_video_audio_extra_args(codec_key, output_path=None):
+    if str(codec_key or "").lower() != "flac":
+        return []
+    if output_path is not None and osp.splitext(os.fspath(output_path))[1].lower() == ".mov":
+        raise ValueError("FLAC soundtracks require MP4 or MKV; choose AAC or ALAC for MOV.")
+    return ["-sample_fmt", "s16", "-strict", "-2"]
 
 
 def _infer_video_dimensions(tensor):
@@ -419,7 +420,7 @@ def save_audio_file(path, audio_data, sample_rate, codec_key="wav"):
     if settings["format"] == "wav":
         return write_wav_file(path, audio_data, sample_rate)
     if settings["format"] == "flac":
-        sf.write(path, _prepare_audio_array(audio_data), int(sample_rate), subtype="PCM_16", format="FLAC")
+        sf.write(path, _prepare_audio_array(audio_data), int(sample_rate), format="FLAC", subtype="PCM_16")
         return path
     fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="audio_")
     os.close(fd)
@@ -553,7 +554,7 @@ def extract_audio_tracks(source_video, verbose=False, query_only=False, codec_ke
         if audio_settings["bitrate"]:
             output_kwargs['b:a'] = audio_settings["bitrate"]
         if audio_settings.get("sample_fmt"):
-            output_kwargs['sample_fmt'] = audio_settings["sample_fmt"]
+            output_kwargs["sample_fmt"] = audio_settings["sample_fmt"]
         ffmpeg.input(source_path, **time_args).output(temp_path, **output_kwargs).overwrite_output().run(cmd=_ffmpeg_binary(), quiet=not verbose)
 
     return file_paths, metadata
@@ -570,7 +571,10 @@ def combine_and_concatenate_video_with_audio_tracks(
     verbose = False,
     pad_audio_to_video=False,
 ):
-    audio_codec = get_mp4_audio_codec_settings(audio_codec_key)["codec"]
+    extra_audio_args = get_video_audio_extra_args(audio_codec_key, save_path_tmp)
+    audio_settings = get_mp4_audio_codec_settings(audio_codec_key)
+    audio_codec = audio_settings["codec"]
+    audio_bitrate = audio_settings["bitrate"]
     inputs, filters, maps, idx = ['-i', video_path], [], ['-map', '0:v'], 1
     metadata_args = []
     sources = source_audio_tracks or []
@@ -638,7 +642,8 @@ def combine_and_concatenate_video_with_audio_tracks(
            '-filter_complex', ';'.join(filters),  # ✅ Only change made
            *maps, *metadata_args,
            '-c:v', 'copy',
-           *get_video_audio_encode_args(audio_codec_key),
+           '-c:a', audio_codec, *extra_audio_args,
+           *(['-b:a', audio_bitrate] if audio_bitrate else []),
            '-ar', str(audio_sampling_rate),
            '-shortest', save_path_tmp]
 
@@ -659,6 +664,7 @@ def subtitle_stream_count(path):
 def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
                                      audio_metadata=None, audio_codec_key="aac_128", verbose=False, video_duration=None, subtitle_source=None):
     """Mux audio tracks, and the subtitle tracks of subtitle_source when given, with the video stream of target_video."""
+    extra_audio_args = get_video_audio_extra_args(audio_codec_key, output_video)
     if not audio_tracks and subtitle_source is None:
         if verbose: print("No audio tracks to combine."); return False
 
@@ -694,7 +700,10 @@ def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
         if (lang := meta.get('language')):
             cmd += ['-metadata:s:a:' + str(i), f'language={lang}']
 
-    cmd += ['-c:v', 'copy', *get_video_audio_encode_args(audio_codec_key)]
+    audio_settings = get_mp4_audio_codec_settings(audio_codec_key)
+    cmd += ['-c:v', 'copy', '-c:a', audio_settings["codec"], *extra_audio_args]
+    if audio_settings["bitrate"]:
+        cmd += ['-b:a', audio_settings["bitrate"]]
     cmd += ['-t', str(dur), output_video]
 
     result = subprocess.run(cmd, capture_output=not verbose, text=True, encoding="utf-8", errors="replace")

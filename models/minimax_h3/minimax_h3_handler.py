@@ -9,6 +9,7 @@ import torch
 from shared.utils.download import process_files_def_if_needed
 from shared.utils.hf import build_hf_url
 from shared.utils.frame_scheduler import normalize_overlap
+from shared.utils.generation_overrides import get_override, set_override
 
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_EXCERPT_SETTINGS, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
 from .constants import (H3_AUDIO_REFINEMENT_SETTING, H3_CONTROL_LATENT_CONTINUATION, H3_MASK_MODE_DEFAULT, H3_MASK_MODE_GROUPED_ROWS,
@@ -280,8 +281,8 @@ The extra phase uses the text prompt and the locked final video only. Reference 
 """
 
 H3_COMMON_RUNTIME_INFOS = """
-- **Sol-Attn:** in **Advanced Mode > Misc. > Override Attention Mode**, select **sol**. The **Start Tau** slider then appears below the attention selector and shows that End Tau is fixed at `0.8`. H3 defaults to `1.3`; this value is used on the first denoising step and decreases linearly to `0.8` on the final step. Use `1.0` for the Sol-Attn paper starting value, increase it to route more attention blocks through the approximate path for greater speed, or lower it for denser attention and higher fidelity. It uses sparse attention only on large visual sequences and requires BF16, Triton 3.6 or newer, and a CUDA NVIDIA GPU using SM86, SM89, SM90, SM100, SM120, or SM121 (such as RTX 30/40/50-series, H100/H200, B100/B200, or DGX Spark); the dropdown reports whether it is available on the current system.
-- **Text Encoder:** at the bottom of **Misc.**, use the **Text Encoder** configuration to reduce system RAM. **Qwen3-VL BF16** uses the most memory; **Quanto INT8** is a balanced lower-memory choice; **NVFP4 AWQ**, **GGUF Q4_K_M**, and especially **GGUF Q2_K** reduce it further. More aggressive quantization can slightly affect prompt interpretation.
+- **Sol-Attn:** in **Advanced Mode > Configs > Override Attention Mode**, select **sol**. The **Start Tau** slider then appears below the attention selector and shows that End Tau is fixed at `0.8`. H3 defaults to `1.3`; this value is used on the first denoising step and decreases linearly to `0.8` on the final step. Use `1.0` for the Sol-Attn paper starting value, increase it to route more attention blocks through the approximate path for greater speed, or lower it for denser attention and higher fidelity. It uses sparse attention only on large visual sequences and requires BF16, Triton 3.6 or newer, and a CUDA NVIDIA GPU using SM86, SM89, SM90, SM100, SM120, or SM121 (such as RTX 30/40/50-series, H100/H200, B100/B200, or DGX Spark); the dropdown reports whether it is available on the current system.
+- **Text Encoder:** at the bottom of **Configs**, use the **Text Encoder** configuration to reduce system RAM. **Qwen3-VL BF16** uses the most memory; **Quanto INT8** is a balanced lower-memory choice; **NVFP4 AWQ**, **GGUF Q4_K_M**, and especially **GGUF Q2_K** reduce it further. More aggressive quantization can slightly affect prompt interpretation.
 - **Priority:** beside the Text Encoder configuration, choose which memory limit matters most. **Lower VRAM** uses all code optimizations and reduces greatly VRAM consumption while **Lower RAM** uses only VRAM optimizations that doesnt consume extra RAM.
 """
 
@@ -862,7 +863,7 @@ class family_handler:
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
         if model_def.get("veda", False):
-            inputs["override_attention"] = "veda"
+            inputs["overrides"] = set_override(inputs["overrides"], "attention_mode", "veda")
         if ((inputs.get("spatial_upsampling") or "").startswith(X2_VAE_METHOD) and int(inputs["image_mode"]) == 0
                 and base_model_type not in (REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE)
                 and "2" in inputs["audio_prompt_type"]):
@@ -916,7 +917,7 @@ class family_handler:
         outpainting = get_outpainting_dims(inputs.get("video_guide_outpainting"), inputs.get("video_guide_outpainting_ratio", "")) is not None
         if outpainting and base_model_type not in CONTROL_ARCHITECTURES and not grouped_masking:
             return "MiniMax H3 outpainting requires Mask Denoising Mode to be set to Grouped Rows"
-        if grouped_masking and inputs.get("override_attention") == "sol":
+        if grouped_masking and get_override(inputs["overrides"], "attention_mode") == "sol":
             masked_control = inputs.get("video_mask") is not None or outpainting or "A" in (inputs.get("video_prompt_type") or "")
             if masked_control:
                 return "MiniMax H3 Grouped Rows mask denoising is not compatible with Sol Attention; select Shared Timestep or another attention mode"
@@ -1165,9 +1166,9 @@ class family_handler:
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
         if model_def.get("veda", False):
-            ui_defaults["override_attention"] = "veda"
-        elif ui_defaults.get("override_attention") == "veda":
-            ui_defaults["override_attention"] = ""
+            ui_defaults["overrides"] = set_override(ui_defaults.get("overrides", ""), "attention_mode", "veda")
+        elif get_override(ui_defaults.get("overrides", ""), "attention_mode") == "veda":
+            ui_defaults["overrides"] = set_override(ui_defaults["overrides"], "attention_mode", "")
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE:
             return
         if base_model_type in CONTROL_ARCHITECTURES:
