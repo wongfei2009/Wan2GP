@@ -17,7 +17,6 @@ _RAW_MODEL_TYPE = "krea2_raw"
 _TURBO_MODEL_TYPE = "krea2_turbo"
 _RAW_EDIT_MODEL_TYPE = "krea2_raw_edit"
 _TURBO_EDIT_MODEL_TYPE = "krea2_turbo_edit"
-_TURBO_OSTRIS_EDIT_MODEL_TYPE = "krea2_turbo_ostris_edit"
 _PROFILE_DIR = "krea2"
 _PRESET_PROFILE_DIR = "krea2_presets"
 
@@ -84,32 +83,6 @@ class family_handler:
                 "infos": "Generate an image from the Text Prompt (`prompt`). In Inpainting mode, a Control Image and mask provide the surrounding context while the prompt describes the replacement content; WanGP uses the selected LanPaint method. The text, retained context and masked region jointly determine the result.",
                 "prompt_infos": 'Describe the image you want in natural language, including subject, pose or action, framing, environment, lighting and style. Start with a short concrete idea; add detail when precise composition matters. Put literal lettering in quotes. For inpainting, describe the finished scene and the desired content inside the mask, for example: "A man in a green jacket sits at the cafe table, warm evening light."',
             })
-        if base_model_type == _TURBO_OSTRIS_EDIT_MODEL_TYPE:
-            # Ostris reference conditioning (t=0 reference tokens at the sequence tail), for LoRAs
-            # trained with ai-toolkit's krea2 edit mode. Plain "I" references only — no "K" concept,
-            # no inpainting, and reference backgrounds must be kept (a style ref IS its background).
-            result.update({
-                "ostris_edit": True,
-                "inpaint_support": False,
-                "image_ref_choices": {
-                    "choices": [
-                        ("None", ""),
-                        ("Reference Images the model draws content / style from", "I"),
-                    ],
-                    "letters_filter": "I",
-                    "default": "I",
-                },
-                "at_least_one_image_ref_needed": True,
-                # Vision tower comes from the same standalone checkpoint the identity-edit
-                # models use (upstream split it out of the combined VL file).
-                "vision_encoder_filename": os.path.join(_TEXT_ENCODER_FOLDER, _VISION_ENCODER_FILENAME),
-                "preload_URLs": [
-                    build_hf_url(_PROJECT_REPO, _TEXT_ENCODER_FOLDER, _VISION_ENCODER_FILENAME)
-                    + f"|{_TEXT_ENCODER_FOLDER}"
-                ],
-            })
-            result.pop("guide_custom_choices_image", None)
-            result.pop("model_modes", None)
         if edit:
             result.update({
                 "specialities": [{"name": "identity-preserving edits", "aliases": ["identity preservation"]}, {"name": "subject placement"}],
@@ -149,11 +122,11 @@ class family_handler:
 
     @staticmethod
     def query_supported_types():
-        return [_RAW_MODEL_TYPE, _TURBO_MODEL_TYPE, _RAW_EDIT_MODEL_TYPE, _TURBO_EDIT_MODEL_TYPE, _TURBO_OSTRIS_EDIT_MODEL_TYPE]
+        return [_RAW_MODEL_TYPE, _TURBO_MODEL_TYPE, _RAW_EDIT_MODEL_TYPE, _TURBO_EDIT_MODEL_TYPE]
 
     @staticmethod
     def query_family_maps():
-        compatible = [_RAW_MODEL_TYPE, _TURBO_MODEL_TYPE, _RAW_EDIT_MODEL_TYPE, _TURBO_EDIT_MODEL_TYPE, _TURBO_OSTRIS_EDIT_MODEL_TYPE]
+        compatible = [_RAW_MODEL_TYPE, _TURBO_MODEL_TYPE, _RAW_EDIT_MODEL_TYPE, _TURBO_EDIT_MODEL_TYPE]
         return {}, {model_type: compatible for model_type in compatible}
 
     @staticmethod
@@ -223,16 +196,13 @@ class family_handler:
     @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):
         edit = base_model_type in (_RAW_EDIT_MODEL_TYPE, _TURBO_EDIT_MODEL_TYPE)
-        ostris_edit = base_model_type == _TURBO_OSTRIS_EDIT_MODEL_TYPE
-        ui_defaults.update({"image_mode": 1, "batch_size": 1, "model_mode": 0 if edit or ostris_edit else 2, "denoising_strength": 1.0, "masking_strength": 1.0})
-        if base_model_type in (_TURBO_MODEL_TYPE, _TURBO_EDIT_MODEL_TYPE, _TURBO_OSTRIS_EDIT_MODEL_TYPE):
+        ui_defaults.update({"image_mode": 1, "batch_size": 1, "model_mode": 0 if edit else 2, "denoising_strength": 1.0, "masking_strength": 1.0})
+        if base_model_type in (_TURBO_MODEL_TYPE, _TURBO_EDIT_MODEL_TYPE):
             ui_defaults.update({"num_inference_steps": 8, "guidance_scale": 0, "resolution": "1024x1024"})
         else:
             ui_defaults.update({"num_inference_steps": 20 if base_model_type == _RAW_EDIT_MODEL_TYPE else 52, "guidance_scale": 2 if base_model_type == _RAW_EDIT_MODEL_TYPE else 3.5, "resolution": "1024x1024"})
         if edit:
             ui_defaults.update({"video_prompt_type": "KI", "remove_background_images_ref": 0})
-        elif ostris_edit:
-            ui_defaults.update({"video_prompt_type": "I", "remove_background_images_ref": 0})
 
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
@@ -267,8 +237,6 @@ class family_handler:
             max_refs = 1 if inputs.get("image_mode") == 2 else 2
             if len(inputs.get("image_refs") or []) > max_refs:
                 return "Krea 2 Edit supports at most two Reference Images."
-        if base_model_type == _TURBO_OSTRIS_EDIT_MODEL_TYPE and len(inputs.get("image_refs") or []) > 3:
-            return "Krea 2 Ostris Edit supports at most three Reference Images."
         model_mode_int = family_handler.normalize_lanpaint_strengths(inputs)
         if inputs.get("denoising_strength", 1) < 1 and model_mode_int != 0:
             gr.Info("Denoising Strength will be ignored if Masked Denoising is not used")

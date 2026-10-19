@@ -106,17 +106,10 @@ class Qwen3VLConditioner(torch.nn.Module):
         self.prompt_template_encode_start_idx = 34
         self.prompt_template_encode_suffix_start_idx = 5
 
-    def _tokenize(self, text: list[str], device, images=None, picture_markers=False):
+    def _tokenize(self, text: list[str], device, images=None):
         prefix_idx = self.prompt_template_encode_start_idx
         target_device = torch.device(device)
-        if images is None:
-            vision = ""
-        elif picture_markers:
-            # Ostris edit conditioning: each reference is introduced by a "Picture N:" marker
-            # (string copied verbatim from the ai-toolkit / ComfyUI-Krea2-Ostris-Edit implementation).
-            vision = "".join("Picture {}: <|vision_start|><|image_pad|><|vision_end|>".format(image_no) for image_no in range(1, len(images) + 1))
-        else:
-            vision = "<|vision_start|><|image_pad|><|vision_end|>" * len(images)
+        vision = "" if images is None else "<|vision_start|><|image_pad|><|vision_end|>" * len(images)
         prefixed_text = [self.prompt_template_encode_prefix + vision + item for item in text]
         suffix_text = [self.prompt_template_encode_suffix] * len(text)
         # Tokenizers create PyTorch tensors via the global default device; pin that choice here so MMGP
@@ -136,11 +129,11 @@ class Qwen3VLConditioner(torch.nn.Module):
         return input_ids, mask, position_ids, prefix_idx, inputs
 
     @torch.inference_mode()
-    def forward(self, text: list[str], device, images=None, picture_markers=False):
+    def forward(self, text: list[str], device, images=None):
         self.qwen.language_model._interrupt = getattr(self, "_interrupt", False)
         if getattr(self, "_interrupt", False):
             return None, None
-        input_ids, mask, position_ids, prefix_idx, inputs = self._tokenize(text, device=device, images=images, picture_markers=picture_markers)
+        input_ids, mask, position_ids, prefix_idx, inputs = self._tokenize(text, device=device, images=images)
         inputs_embeds = visual_pos_masks = deepstack_visual_embeds = None
         if images is not None:
             image_grid_thw = inputs["image_grid_thw"]
@@ -211,20 +204,11 @@ class Krea2Pipeline:
         latents = (latents * latents_std) + latents_mean
         return self.vae.decode_to_cpu_uint8(latents)[:, :, 0]
 
-    def _encode_image_to_latents(self, image, width, height, device, dtype, fit=False, resize_to_target=True, fit_area=None):
+    def _encode_image_to_latents(self, image, width, height, device, dtype, fit=False, resize_to_target=True):
         from shared.utils.utils import convert_image_to_tensor
 
         image = image.convert("RGB")
-        if fit_area is not None:
-            # Ostris edit references: fit into fit_area pixels (downscale only), keep aspect,
-            # snap dims to the latent grid (round, like the reference implementation). BOX ~ "area" resampling.
-            snap = self.compression * self.transformer.config.patch
-            scale = min(1.0, math.sqrt(fit_area / (image.width * image.height)))
-            fit_width = max(round(image.width * scale / snap) * snap, snap)
-            fit_height = max(round(image.height * scale / snap) * snap, snap)
-            if (fit_width, fit_height) != (image.width, image.height):
-                image = image.resize((fit_width, fit_height), resample=Image.Resampling.BOX)
-        elif fit:
+        if fit:
             image_width, image_height = image.size
             scale = min(height / image_height, width / image_width)
             if image_height * scale >= height * 0.92 and image_width * scale >= width * 0.92:
@@ -265,12 +249,12 @@ class Krea2Pipeline:
         image = image.convert("RGB").resize((width, height), resample=Image.Resampling.LANCZOS)
         return convert_image_to_tensor(image).add(1).mul(127.5).round().clamp(0, 255).to(torch.uint8).unsqueeze(0)
 
-    def _encode_prompts(self, prompts, device, dtype, images=None, picture_markers=False):
+    def _encode_prompts(self, prompts, device, dtype, images=None):
         self.encoder._interrupt = self._interrupt
         self.encoder.qwen.language_model._interrupt = self._interrupt
 
         def encode_fn(prompt_batch):
-            hiddens, masks = self.encoder(prompt_batch, device=device, images=images, picture_markers=picture_markers)
+            hiddens, masks = self.encoder(prompt_batch, device=device, images=images)
             if hiddens is None:
                 raise _TextEncodingInterrupted
             return [(hiddens[i], masks[i]) for i in range(len(prompt_batch))]
@@ -316,7 +300,6 @@ class Krea2Pipeline:
         reference_images=None,
         fit_all_references=False,
         reference_offsets=None,
-        ostris_edit=False,
         vae_upsampler=None,
         vae_upsampler_seed: int = 0,
         vae_upsampler_progress_callback=None,
@@ -335,19 +318,12 @@ class Krea2Pipeline:
         for i in range(batch_size):
             noise[i]= torch.randn(self.channels, height // self.compression, width // self.compression, device=device, dtype=dtype, generator=torch.Generator(device=device).manual_seed(int(seed) + i))
         edit = bool(reference_images)
-        ostris = bool(ostris_edit) and edit
         grounding_images = None
         if edit:
             grounding_images = []
             for image in reference_images:
                 image = image.convert("RGB")
-                if ostris:
-                    # Ostris edit conditioning: the vision tower sees a coarse reference fit to
-                    # 384x384 total pixels (downscale only, aspect kept).
-                    scale = min(1.0, math.sqrt(384 * 384 / (image.width * image.height)))
-                    if scale < 1.0:
-                        image = image.resize((max(round(image.width * scale), 1), max(round(image.height * scale), 1)), Image.Resampling.BOX)
-                elif max(image.size) > 768:
+                if max(image.size) > 768:
                     scale = 768 / max(image.size)
                     image = image.resize((round(image.width * scale), round(image.height * scale)), Image.Resampling.LANCZOS)
                 grounding_images.append(image)
@@ -355,7 +331,7 @@ class Krea2Pipeline:
         cache_keys = [(self.encoder.max_length, tuple(self.encoder.select_layers), p) for p in pending_prompts]
         prompt_count = len(pending_prompts) if grounding_images is not None else sum(k not in self.text_encoder_cache._entries for k in dict.fromkeys(cache_keys))
         with text_encoding_prompts(prompt_count):
-            txt, txtmask = self._encode_prompts(prompts, device, dtype, images=grounding_images, picture_markers=ostris)
+            txt, txtmask = self._encode_prompts(prompts, device, dtype, images=grounding_images)
             if txt is None:
                 return None
             cfg = guidance > 0
@@ -364,7 +340,7 @@ class Krea2Pipeline:
             nagtxt = nagtxtmask = None
             context_len = txt.shape[1]
             if float(NAG_scale) > 1.0 and not cfg:
-                nagtxt, nagtxtmask = self._encode_prompts(negative_prompts, device, dtype, images=grounding_images, picture_markers=ostris)
+                nagtxt, nagtxtmask = self._encode_prompts(negative_prompts, device, dtype, images=grounding_images)
                 if nagtxt is None:
                     return None
                 context_len = max(txt.shape[1], nagtxt.shape[1])
@@ -373,7 +349,7 @@ class Krea2Pipeline:
                 NAG = {"scale": float(NAG_scale), "tau": float(NAG_tau), "alpha": float(NAG_alpha), "cap_embed_len": context_len, "prefix_len": 0}
             x, pos, mask = _prepare(noise, context_len, patch, txtmask)
             if cfg:
-                untxt, untxtmask = self._encode_prompts(negative_prompts, device, dtype, images=grounding_images, picture_markers=ostris)
+                untxt, untxtmask = self._encode_prompts(negative_prompts, device, dtype, images=grounding_images)
                 if untxt is None:
                     return None
                 _, unpos, unmask = _prepare(noise, untxt.shape[1], patch, untxtmask)
@@ -382,27 +358,7 @@ class Krea2Pipeline:
         ts = _timesteps(x.shape[1], steps, x1, x2, x.device, y1=y1, y2=y2, mu=mu)
         img = x
         reference_tokens = []
-        if edit and ostris:
-            reference_positions = []
-            reference_masks = []
-            for frame_no, image in enumerate(reference_images, start=1):
-                latents = self._encode_image_to_latents(image, width, height, device, dtype, fit_area=1024 * 1024)
-                grid_h, grid_w = latents.shape[-2] // patch, latents.shape[-1] // patch
-                reference_tokens.append(_pack_image_latents(latents, patch).expand(batch_size, -1, -1).contiguous())
-                # RoPE: axis 0 = reference index (1-based), y/x grids 0-based (no target-grid centering).
-                ref_pos = torch.zeros(batch_size, grid_h * grid_w, 3, device=device)
-                ref_pos[..., 0] = frame_no
-                ref_pos[..., 1] = torch.arange(grid_h, device=device).view(-1, 1).expand(grid_h, grid_w).reshape(-1)
-                ref_pos[..., 2] = torch.arange(grid_w, device=device).view(1, -1).expand(grid_h, grid_w).reshape(-1)
-                reference_positions.append(ref_pos)
-                reference_masks.append(torch.ones(batch_size, grid_h * grid_w, device=device, dtype=torch.bool))
-            # References ride at the tail of the sequence (after the noisy target tokens).
-            pos = torch.cat([pos] + reference_positions, dim=1)
-            mask = torch.cat([mask] + reference_masks, dim=1)
-            if cfg:
-                unpos = torch.cat([unpos] + reference_positions, dim=1)
-                unmask = torch.cat([unmask] + reference_masks, dim=1)
-        elif edit:
+        if edit:
             target_grid_h, target_grid_w = height // align, width // align
             reference_positions = []
             reference_masks = []
@@ -423,9 +379,8 @@ class Krea2Pipeline:
             if cfg:
                 unpos = torch.cat([unpos[:, :untxt.shape[1]]] + reference_positions + [unpos[:, untxt.shape[1]:]], dim=1)
                 unmask = torch.cat([unmask[:, :untxt.shape[1]]] + reference_masks + [unmask[:, untxt.shape[1]:]], dim=1)
-        reference_len = sum(tokens.shape[1] for tokens in reference_tokens)
         if NAG is not None:
-            NAG["query_start"] = context_len if ostris else context_len + reference_len
+            NAG["query_start"] = context_len + sum(tokens.shape[1] for tokens in reference_tokens)
             NAG["query_end"] = NAG["query_start"] + img.shape[1]
         self.transformer._interrupt = self._interrupt
         model_mode_int = None
@@ -499,25 +454,15 @@ class Krea2Pipeline:
                 if untxt is None:
                     return None
         t_values = torch.tensor(ts[:-1], dtype=img.dtype, device=img.device)
-        # Ostris edit conditioning: the clean reference span modulates with a t=0 vector.
-        ostris_refs = ostris and reference_len > 0
-        zero_t = torch.zeros_like(t_values[:1])
-        ref_step_tvecs = None
         if timestep_static:
             offload.set_step_no_for_lora(self.transformer, 0)
             t_all, tvec_all = self.transformer.prepare_timestep(t_values)
             step_tensors = tuple((t_all[i : i + 1], tvec_all[i : i + 1]) for i in range(updated_steps))
-            if ostris_refs:
-                _, ref_tvec = self.transformer.prepare_timestep(zero_t)
-                ref_step_tvecs = (ref_tvec,) * updated_steps
         else:
             step_tensors = []
-            ref_step_tvecs = [] if ostris_refs else None
             for step_no, tcurr in enumerate(t_values):
                 offload.set_step_no_for_lora(self.transformer, step_offset + step_no)
                 step_tensors.append(self.transformer.prepare_timestep(tcurr[None]))
-                if ostris_refs:
-                    ref_step_tvecs.append(self.transformer.prepare_timestep(zero_t)[1])
         torch.cuda.empty_cache()
         for i, (tcurr, tprev) in enumerate(tqdm(list(zip(ts[:-1], ts[1:])), total=updated_steps)):
             offload.set_step_no_for_lora(self.transformer, step_offset + i)
@@ -525,15 +470,9 @@ class Krea2Pipeline:
             if self._interrupt:
                 return None
             t, tvec = step_tensors[i]
-            ref_kwargs = {"ref_len": reference_len, "ref_tvec": ref_step_tvecs[i]} if ostris_refs else {}
 
             def run_model(latents, cfg_scale):
-                if not edit:
-                    model_latents = latents
-                elif ostris:
-                    model_latents = torch.cat([latents] + reference_tokens, dim=1)
-                else:
-                    model_latents = torch.cat(reference_tokens + [latents], dim=1)
+                model_latents = torch.cat(reference_tokens + [latents], dim=1) if edit else latents
                 step_txt = txt if context_static else self.transformer.prepare_context(txt, mask, context_len)
                 if step_txt is None:
                     return None, None
@@ -546,13 +485,13 @@ class Krea2Pipeline:
                     step_untxt = untxt if context_static else self.transformer.prepare_context(untxt, unmask)
                     if step_untxt is None:
                         return None, None
-                    cond, uncond = self.transformer.forward_cfg(img=model_latents, context=step_txt, uncond_context=step_untxt, t=t, tvec=tvec, pos=pos, uncond_pos=unpos, mask=mask, uncond_mask=unmask, target_len=latents.shape[1], **ref_kwargs)
+                    cond, uncond = self.transformer.forward_cfg(img=model_latents, context=step_txt, uncond_context=step_untxt, t=t, tvec=tvec, pos=pos, uncond_pos=unpos, mask=mask, uncond_mask=unmask, target_len=latents.shape[1])
                     if cond is None or uncond is None:
                         return None, None
                     if not torch.isfinite(cond).all() or not torch.isfinite(uncond).all():
                         raise RuntimeError("Krea 2 produced non-finite CFG denoiser predictions.")
                     return cond, uncond
-                cond = self.transformer(img=model_latents, context=step_txt, t=t, tvec=tvec, pos=pos, mask=mask, NAG=NAG, neg_context=step_nagtxt, neg_mask=nagtxtmask, target_len=latents.shape[1], **ref_kwargs)
+                cond = self.transformer(img=model_latents, context=step_txt, t=t, tvec=tvec, pos=pos, mask=mask, NAG=NAG, neg_context=step_nagtxt, neg_mask=nagtxtmask, target_len=latents.shape[1])
                 if cond is None:
                     return None, None
                 if not torch.isfinite(cond).all():
@@ -787,16 +726,14 @@ class model_factory:
         text_encoder_folder = model_def["text_encoder_folder"]
         text_encoder_config_path = fl.locate_file(os.path.join(text_encoder_folder, "config.json"))
         edit = base_model_type in ("krea2_raw_edit", "krea2_turbo_edit")
-        ostris_edit = bool((model_def or {}).get("ostris_edit"))
-        with_vision = edit or ostris_edit
         vision_encoder_filename = None
-        if with_vision:
+        if edit:
             vision_encoder_filename = fl.locate_file(model_def["vision_encoder_filename"])
         text_encoder = _load_text_encoder(
             text_encoder_filename,
             text_encoder_config_path,
             dtype,
-            with_vision=with_vision,
+            with_vision=edit,
             vision_encoder_filename=vision_encoder_filename,
         )
         tokenizer_config = fl.locate_file(os.path.join(text_encoder_folder, "tokenizer_config.json"))
@@ -854,8 +791,7 @@ class model_factory:
             else:
                 self.vae.disable_tiling()
         identity_edit = self.base_model_type in ("krea2_raw_edit", "krea2_turbo_edit")
-        ostris_edit = bool((self.model_def or {}).get("ostris_edit"))
-        turbo = self.base_model_type in ("krea2_turbo", "krea2_turbo_edit", "krea2_turbo_ostris_edit")
+        turbo = self.base_model_type in ("krea2_turbo", "krea2_turbo_edit")
         if turbo:
             guide_scale = 0
             kwargs_mu = 1.15
@@ -931,7 +867,6 @@ class model_factory:
             reference_images=reference_images,
             fit_all_references="I" in video_prompt_type and "K" not in video_prompt_type,
             reference_offsets=reference_offsets,
-            ostris_edit=ostris_edit,
             vae_upsampler=vae_upsampler,
             vae_upsampler_seed=generator_seed,
             vae_upsampler_progress_callback=_vae_upsampler_progress,
