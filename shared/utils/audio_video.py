@@ -108,6 +108,15 @@ def append_sliding_window_audio(existing_audio_data, existing_audio_path, genera
     return np.concatenate([prefix_audio, generated_audio[max(0, prefix_audio.shape[0] - join_sample):]], axis=0)
 
 
+def source_audio_repair_ms(repair_ms, audio_path, codec, video_seconds):
+    """Repair margin for continuing a source video: the model margin, unless the source audio runs past the continued frames (an audio
+    tail saved with the video, or frames kept before its end) by at least that margin and two codec frames, a lossy encoder dropping a
+    partial frame and coding the ~40 ms before the end of a stream less faithfully."""
+    codec, info = str(codec or "").lower(), sf.info(audio_path)
+    clear_ms = max(repair_ms, 0.0 if codec.startswith("pcm") or codec in ("flac", "alac") else 2000 * (1152 if codec == "mp3" else 1024) / info.samplerate)
+    return 0 if info.frames / info.samplerate - video_seconds >= clear_ms / 1000 else repair_ms
+
+
 def audio_overlap_repair_seconds(overlap_frames, video_fps, repair_ms, overlap_audio=None, sample_rate=0):
     overlap_seconds = overlap_frames / video_fps
     shortfall = max(0.0, overlap_seconds - len(overlap_audio) / sample_rate) if overlap_audio is not None else 0.0
@@ -570,7 +579,10 @@ def combine_and_concatenate_video_with_audio_tracks(
     audio_codec_key="aac_128",
     verbose = False,
     pad_audio_to_video=False,
+    audio_tail_seconds=0.0,
 ):
+    """audio_tail_seconds keeps that much audio past the last video frame (instead of cutting at the video end), so the end of the
+    video's own audio stays clear of the encoder's end effects."""
     extra_audio_args = get_video_audio_extra_args(audio_codec_key, save_path_tmp)
     audio_settings = get_mp4_audio_codec_settings(audio_codec_key)
     audio_codec = audio_settings["codec"]
@@ -638,6 +650,10 @@ def combine_and_concatenate_video_with_audio_tracks(
 
         maps += ['-map', f'[aout{i}]']
 
+    duration_args = ['-shortest']
+    if audio_tail_seconds > 0:
+        video_duration = float(next(s for s in ffmpeg.probe(video_path, cmd=_ffprobe_binary())['streams'] if s['codec_type'] == 'video')['duration'])
+        duration_args = ['-t', str(video_duration + audio_tail_seconds)]
     cmd = [_ffmpeg_binary(), '-y', *inputs,
            '-filter_complex', ';'.join(filters),  # ✅ Only change made
            *maps, *metadata_args,
@@ -645,7 +661,7 @@ def combine_and_concatenate_video_with_audio_tracks(
            '-c:a', audio_codec, *extra_audio_args,
            *(['-b:a', audio_bitrate] if audio_bitrate else []),
            '-ar', str(audio_sampling_rate),
-           '-shortest', save_path_tmp]
+           *duration_args, save_path_tmp]
 
     if verbose:
         print(f"ffmpeg command: {cmd}")
