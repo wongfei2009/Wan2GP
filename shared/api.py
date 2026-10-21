@@ -1065,6 +1065,86 @@ class WanGPSession:
             "height": height,
         }
 
+    def _run_manga_line(self, image, detect_resolution: int):
+        import torch
+
+        from preprocessing.manga_line import MangaLineDetector
+        from preprocessing.manga_line.assets import WEIGHTS
+        from shared.utils import files_locator as fl
+
+        detector = MangaLineDetector(fl.locate_file(WEIGHTS), "cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            return detector(image, detect_resolution)
+        finally:
+            # Hand the VRAM back before the next generation loads a model.
+            detector.to("cpu")
+            del detector
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def manga_finish(self, image: str, *, levels: bool = False, levels_black: float = 0.20, levels_white: float = 0.70, levels_gamma: float = 1.3, screen_lines: int = 250, white_point: float = 0.80, black_point: float = 0.30, light_tone: float = 0.18, dark_tone: float = 0.42, gradation: float = 1.0, pen_lines: bool = True, pen_threshold: float = 0.30, pen_resolution: int | None = None, white_lines: float = 0.4, frame: str = "original", crop_x: float = 0.5, crop_y: float = 0.4, border: int = 5, margin: int = 60, paper: str = "white", ink: float = 0.5) -> dict[str, Any]:
+        from PIL import ImageOps
+
+        from shared import manga_screen
+        from shared.utils.download import process_files_def
+        from shared.utils.process_locks import acquire_GPU_ressources, release_GPU_ressources
+        from shared.utils.utils import sanitize_file_name
+        from preprocessing.manga_line.assets import query_download_def
+
+        if frame not in manga_screen.FRAMES:
+            raise ValueError(f"frame must be one of: {', '.join(manga_screen.FRAMES)}")
+        if paper not in manga_screen.PAPERS:
+            raise ValueError(f"paper must be one of: {', '.join(manga_screen.PAPERS)}")
+        if int(screen_lines) <= 0:
+            raise ValueError("screen_lines must be positive")
+        if pen_lines:
+            # Fail fast rather than block: acquire_GPU_ressources would wait out a whole job.
+            with self._job_lock:
+                if self._active_job is not None and not self._active_job.done:
+                    raise RuntimeError("WanGP session already has a generation in progress")
+        runtime = self._ensure_runtime()
+        with _pushd(runtime.root):
+            output_dir = self._output_dir if self._output_dir is not None else getattr(runtime.module, "image_save_path", None) or "outputs"
+            output_root = os.path.realpath(str(output_dir))
+            source_path = _resolve_in_outputs(image, output_root, "Image")
+
+            # PIL, not cv2.imread: OpenCV cannot open a non-ASCII path on Windows, and output
+            # names carry the prompt. exif_transpose matches ComfyUI's LoadImage.
+            with Image.open(source_path) as handle:
+                rgb = np.asarray(ImageOps.exif_transpose(handle).convert("RGB"))
+            height, width = rgb.shape[:2]
+            if levels:
+                rgb = manga_screen.levels(rgb, float(levels_black), float(levels_white), float(levels_gamma))
+
+            pen = None
+            if pen_lines:
+                # The MangaScreen workflow runs the line model at the image WIDTH (applied to the
+                # short side). Capped so a 4K page does not push a ~6Kx4K map through the network.
+                detect_resolution = int(pen_resolution) if pen_resolution else min(width, 2048)
+                process_files_def(**query_download_def())
+                acquire_GPU_ressources(self._state, "manga_line", "Manga Line")
+                try:
+                    pen = manga_screen.pen_map(self._run_manga_line(rgb, detect_resolution), rgb.shape[:2])
+                finally:
+                    release_GPU_ressources(self._state, "manga_line")
+
+            paper_mask = manga_screen.finish(rgb, int(screen_lines), float(white_point), float(black_point), float(light_tone), float(dark_tone), float(gradation), pen, float(pen_threshold), float(white_lines))
+            page = manga_screen.panel(paper_mask, frame, float(crop_x), float(crop_y), int(border), int(margin), paper, float(ink))
+
+            # PNG: a JPEG would smear the binary dot screen.
+            stem = sanitize_file_name(Path(source_path).stem)
+            page_path = os.path.join(output_root, f"{stem}_manga_{time.strftime('%Y%m%d_%H%M%S')}.png")
+            Image.fromarray(page).save(page_path)
+        return {
+            "page": str(Path(page_path).resolve()),
+            "width": int(page.shape[1]),
+            "height": int(page.shape[0]),
+            "source_width": int(width),
+            "source_height": int(height),
+            "pen_lines": pen is not None,
+            "levels": bool(levels),
+        }
+
     def submit(self, source: str | os.PathLike[str] | dict[str, Any] | list[dict[str, Any]], callbacks: object | None = None) -> SessionJob:
         tasks = self._normalize_source(source, caller_base_path=self._get_caller_base_path())
         return self._submit_tasks(tasks, callbacks=callbacks)
